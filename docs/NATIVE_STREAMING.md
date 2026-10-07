@@ -291,6 +291,59 @@ cluster, one indirect draw), as the web viewer already does, with EEVEE/Cycles f
 `tests/slot_gui_check.py` in Solid now switches copies (it timed out before) but not yet the one in front
 of the camera within its window.
 
+## Live Draw: the viewport draws the cuts itself
+
+`addons/vgeo/livedraw.py`. Solid and Material Preview views draw virtualized assets straight from GPU
+buffers; final renders and Rendered views keep the EEVEE/Cycles path above, unchanged (the scene toggle
+**Live Draw** in the VGEO tab, on by default; a view in Rendered shading switches the Blender path back).
+
+- **One vertex buffer per asset.** Every vertex is uploaded once (`vgeo_vertex_arrays`); the DAG indexes
+  them globally, so a cut or an instance level is just index data (`vgeo_range_indices`: a chunk range's
+  selected triangles as global indices, grouped by material).
+- **Cuts** keep an index buffer per 16 chunks and material. A view change re-selects (native, ~1 ms) at
+  most ten times a second while moving, rebuilds only the groups whose chunks changed, and swaps them in
+  together (never half old, half new: no cracks), within a 4 ms per-tick budget.
+- **Instancers**: error levels are shared index buffers (built cheapest first and resumably; finer than 1M
+  triangles never built), drawn instanced per level with placement matrices in a float texture and
+  frustum-culled. Up to 32 nearest heavy copies get a view-dependent cut of their own (kept per placement,
+  with hysteresis). Shared levels use twice the pixel error, since a whole-asset level draws the hidden
+  back too.
+- **Shading** reads each material's Principled BSDF: base colour, roughness and normal map (image or
+  value; tangent frame from derivatives, so no tangent data), Mapping node scale/offset, scene lights
+  (sun, point) and the world colour, AgX approximated (the viewport's overlay buffer is only sRGB-encoded).
+  Depth-tested against the viewport (Material Preview with overlays hidden hands over a zero depth
+  buffer; it is cleared first, as in CodeNodes).
+- While it runs, the chunk meshes are emptied and their collections disabled in viewports (renders fill
+  them again), and the instancing modifier is hidden from viewports only; that also spares Blender
+  walking ~1,000 empty objects a frame.
+
+Measured (RTX 5090, Blender 5.1.2, Vulkan, Xvfb window; flight forward through the scene with frames timed
+at a draw handler; `tests/live_draw_check.py` for the checks):
+
+| | Blender-mesh path | Live Draw |
+|---|---|---|
+| 1,000-copy field (15.3 billion source triangles), Solid, flying | 86 ms median, worst 3.2 s | 37 ms median, p95 48, worst 61 ms |
+| Same, Material Preview, flying | 43 ms (cut frozen while moving), worst 5.5 s | 37 ms, p95 45, worst 59 ms, cuts live |
+| Triangles drawn on that flight | | 25-30M |
+| Coastal cliff scan (1.54M), Solid / Material Preview | 15 / 18 ms | 15 / 16 ms |
+| Draw handler's own time | | 0.05-3 ms |
+| Orbiting a textured asset (live_draw_check) | | 10-12 ms median |
+| Looks like EEVEE: mean pixel difference | | 2.1/255 cliff, 3.5/255 field, 5.2/255 generated sphere |
+
+![Live Draw (left) and EEVEE (right), same view, Poly Haven cliff](images/live_draw_cliff_vs_eevee.jpg)
+![Live Draw (left) and EEVEE (right), 1,000-copy field](images/live_draw_field_vs_eevee.jpg)
+
+Where the field's 37 ms goes: this window costs ~27 ms a frame on that flight path **with every object
+hidden** (Xvfb and Blender's own viewport; ~11 ms on other views), Live Draw's drawing adds ~4 ms at 30M
+triangles, and the live tick ~8 ms (selection and index buffers). The 60 fps target is not reached here;
+on a real display the baseline should be much lower, but that is not measured.
+
+Not in Live Draw (yet): shadows, ambient occlusion and screen-space effects (EEVEE has them; Live Draw is
+lit directly), procedural textures, extra UV maps and colour attributes in shading (they render), emission,
+transparency, metallic/roughness maps beyond a single image, and per-cluster back-face or occlusion
+culling (copies drawn by a shared level draw their back too). GPU memory: the whole vertex buffer stays
+resident (8M vertices = 256 MB for the 15M rock) plus the built levels.
+
 ## Not yet
 
 - A streamed copy's first assignment creates its chunk objects (one
