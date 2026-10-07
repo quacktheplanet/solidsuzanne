@@ -36,9 +36,30 @@ STREAM_MIN_TRIS = 20_000          # below this, a whole-asset level 0 is cheap e
 _levels_cache = {}   # instancer uid -> (errors ndarray, tris ndarray)
 
 
+_inst_cache = {}
+
+
 def instancers(scene=None):
+    """Instancer objects (cached briefly, like stream.proxies: the live loop asks several times a tick)."""
+    import time
     objs = scene.objects if scene is not None else bpy.data.objects
-    return [o for o in objs if o.type == 'MESH' and o.vgeo_inst.uid and o.vgeo_inst.levels is not None]
+    # interactive sessions: cached by time (computing even len() of these collections walks them);
+    # background scripts and tests always scan, so they never see a stale list
+    if bpy.app.background:
+        return [o for o in objs if o.type == 'MESH' and o.vgeo_inst.uid and o.vgeo_inst.levels is not None]
+    key = scene.name if scene is not None else None
+    hit = _inst_cache.get(key)
+    now = time.perf_counter()
+    if hit is not None and now - hit[0] < 0.5:
+        try:
+            if all(o.name and o.vgeo_inst.levels is not None for o in hit[1]):
+                return list(hit[1])
+        except ReferenceError:
+            pass
+    out = [o for o in objs if o.type == 'MESH' and o.vgeo_inst.uid and o.vgeo_inst.levels is not None]
+
+    _inst_cache[key] = (now, out)
+    return list(out)
 
 
 def ensure_node_group():

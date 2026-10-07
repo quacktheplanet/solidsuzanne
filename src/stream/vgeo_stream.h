@@ -194,6 +194,18 @@ VGEO_API int vgeo_version(void);
 // version 3: the extra_desc stored at build time; returns its length (0 if none), copies up to buf_len-1 bytes
 VGEO_API int vgeo_extra_desc(void* handle, char* buf, int buf_len);
 
+// Live drawing (GPU-side cuts): the asset's whole vertex arrays (pointers into the mapped file, valid
+// until vgeo_close), so a renderer can upload every vertex once; and, for the current selection, a chunk's
+// triangles as GLOBAL vertex indices into those arrays, grouped by material: material_offsets receives
+// material_count + 1 offsets (in indices). Valid until the next vgeo_chunk_indices/vgeo_close.
+VGEO_API int vgeo_vertex_arrays(void* handle, const float** positions, const float** normals,
+                                const float** uvs, const uint16_t** vmat, uint32_t* vertex_count);
+VGEO_API int vgeo_chunk_indices(void* handle, uint32_t chunk, const uint32_t** indices, uint32_t* index_count,
+                                uint32_t* material_offsets, uint32_t material_count);
+// The same for chunks [first, first + count) in one call (one index list per material for a whole group).
+VGEO_API int vgeo_range_indices(void* handle, uint32_t first, uint32_t count, const uint32_t** indices,
+                                uint32_t* index_count, uint32_t* material_offsets, uint32_t material_count);
+
 #ifdef __cplusplus
 }
 #endif

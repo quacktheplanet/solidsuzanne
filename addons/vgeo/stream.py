@@ -105,10 +105,30 @@ class Runtime:
 
 # ---------------------------------------------------------------- helpers
 
+_proxy_cache = {}
+
+
 def proxies(scene=None):
-    """Virtualized objects, optionally limited to one scene."""
+    """Virtualized objects, optionally limited to one scene. Cached briefly: a scene full of chunk
+    objects made this scan ~2 ms, and the live loop asks several times a tick."""
     objs = scene.objects if scene is not None else bpy.data.objects
-    return [o for o in objs if o.type == 'MESH' and o.vgeo.uid and o.vgeo.path]
+    # interactive sessions: cached by time (computing even len() of these collections walks them);
+    # background scripts and tests always scan, so they never see a stale list
+    if bpy.app.background:
+        return [o for o in objs if o.type == 'MESH' and o.vgeo.uid and o.vgeo.path]
+    key = scene.name if scene is not None else None
+    hit = _proxy_cache.get(key)
+    now = time.perf_counter()
+    if hit is not None and now - hit[0] < 0.5:
+        try:
+            if all(o.name for o in hit[1]):        # ReferenceError if one was deleted
+                return list(hit[1])
+        except ReferenceError:
+            pass
+    out = [o for o in objs if o.type == 'MESH' and o.vgeo.uid and o.vgeo.path]
+
+    _proxy_cache[key] = (now, out)
+    return list(out)
 
 
 def asset_path(obj):
@@ -292,8 +312,12 @@ def sync_visibility(obj, view_layer=None):
         return
     if col.hide_render != obj.hide_render:
         col.hide_render = obj.hide_render
-    if col.hide_viewport != obj.hide_viewport:
-        col.hide_viewport = obj.hide_viewport
+    from . import livedraw
+    # Live Draw draws the viewport itself: its (empty) chunk objects are disabled in viewports, which
+    # also spares Blender walking hundreds of them every frame (13 -> 11 ms a frame in a 1,000-copy field)
+    want = obj.hide_viewport or livedraw.is_active()
+    if col.hide_viewport != want:
+        col.hide_viewport = want
     vl = view_layer or bpy.context.view_layer
     if vl is None:
         return
@@ -908,6 +932,49 @@ def _housekeeping(objs, vl):
                 link_chunks(obj)
 
 
+def _instance_modifier(inst):
+    return next((m for m in inst.modifiers if m.type == 'NODES' and m.node_group
+                 and m.node_group.name.startswith("VGEO Instances")), None)
+
+
+def _enter_live(objs, insts):
+    """Live Draw takes the viewport: the chunk meshes are emptied (they would draw a second copy; a final
+    render fills them again) and the instancers' instancing is hidden from viewports (not from renders)."""
+    from . import instances, livedraw
+    livedraw.set_active(True)
+    for inst in insts:
+        m = _instance_modifier(inst)
+        if m is not None and m.show_viewport:
+            m.show_viewport = False
+        instances.assign_slots(inst, [])           # streamed copies go idle (and empty)
+    for obj in objs:
+        if obj.vgeo.slot_of:
+            continue
+        rt = _runtimes.get(obj.vgeo.uid)
+        if rt is None or rt.asset is None or getattr(rt, "live_cleared", False):
+            continue
+        col = obj.vgeo.collection
+        if col is not None:
+            for ob in col.objects:
+                if ob.type == 'MESH' and len(ob.data.vertices):
+                    ob.data.clear_geometry()
+        rt.invalidate(keep_objects=True)
+        rt.live_cleared = True
+
+
+def _leave_live(insts):
+    """Back to the Blender-mesh path (a view switched to Rendered, or Live Draw was turned off)."""
+    from . import livedraw
+    livedraw.set_active(False)
+    for inst in insts:
+        m = _instance_modifier(inst)
+        if m is not None and not m.show_viewport:
+            m.show_viewport = True
+    for rt in _runtimes.values():
+        rt.live_cleared = False
+        rt.invalidate(keep_objects=True)
+
+
 def _tick():
     if _rendering:
         return 0.25
@@ -924,6 +991,13 @@ def _tick():
         views = viewport_views()
         if not views:
             return 0.25
+        from . import livedraw
+        if livedraw.active():
+            _enter_live(objs, insts)
+            busy = livedraw.tick(views)
+            return 0.0 if busy else TICK
+        if livedraw.is_active():
+            _leave_live(insts)
         for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
             try:
                 if vl is None or inst.visible_get(view_layer=vl):
@@ -986,6 +1060,8 @@ def _on_render_done(scene, depsgraph=None):
     global _rendering
     _rendering = False
     invalidate_all()
+    for rt in _runtimes.values():     # the render filled the chunk meshes: Live Draw empties them again
+        rt.live_cleared = False
 
 
 @persistent

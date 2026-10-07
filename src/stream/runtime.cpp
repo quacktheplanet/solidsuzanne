@@ -99,6 +99,7 @@ struct Asset {
     std::vector<uint32_t> remap_key;
     std::vector<int32_t> remap_val;
     std::vector<float> out_pos, out_nrm, out_uv, out_extra;
+    std::vector<uint32_t> out_gidx;     // vgeo_chunk_indices scratch
     std::vector<int32_t> out_corner, out_mat, out_lod;
     std::vector<int32_t> out_edges, out_corner_edge;
     std::vector<uint64_t> edge_keys;
@@ -1048,4 +1049,68 @@ extern "C" VGEO_API int vgeo_extra_desc(void* handle, char* buf, int buf_len) {
         buf[n] = 0;
     }
     return int(a->extra_desc.size());
+}
+
+extern "C" VGEO_API int vgeo_vertex_arrays(void* handle, const float** positions, const float** normals,
+                                           const float** uvs, const uint16_t** vmat, uint32_t* vertex_count) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a) return 1;
+    if (positions) *positions = a->positions;
+    if (normals) *normals = a->normals;
+    if (uvs) *uvs = a->uvs;
+    if (vmat) *vmat = a->vmat;
+    if (vertex_count) *vertex_count = a->h.vertex_count;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_range_indices(void* handle, uint32_t first, uint32_t count, const uint32_t** indices,
+                                           uint32_t* index_count, uint32_t* material_offsets,
+                                           uint32_t material_count) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || first >= a->h.chunk_count || !indices || !index_count) return 1;
+    const uint32_t last = std::min<uint32_t>(a->h.chunk_count, first + std::max<uint32_t>(1, count));
+    const uint32_t M = std::max<uint32_t>(1, material_count);
+    std::vector<uint32_t> counts(M + 1, 0);
+    // pass 1: triangles per material
+    for (uint32_t chunk = first; chunk < last; ++chunk) {
+        const vgeo2::Chunk& ch = a->chunks[chunk];
+        for (uint32_t k = 0; k < ch.cluster_count; ++k) {
+            uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
+            if (!a->selected[id] || !cluster_ok(*a, id)) continue;
+            const vgeo2::Cluster& c = a->clusters[id];
+            const uint32_t* idx = a->indices + c.index_offset;
+            for (uint32_t t = 0; t < c.tri_count; ++t)
+                counts[std::min<uint32_t>(a->vmat[idx[t * 3]], M - 1) + 1] += 3;
+        }
+    }
+    for (uint32_t m = 0; m < M; ++m) counts[m + 1] += counts[m];
+    a->out_gidx.resize(counts[M]);
+    std::vector<uint32_t> at(counts.begin(), counts.end() - 1);
+    // pass 2: place them
+    for (uint32_t chunk = first; chunk < last; ++chunk) {
+        const vgeo2::Chunk& ch = a->chunks[chunk];
+        for (uint32_t k = 0; k < ch.cluster_count; ++k) {
+            uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
+            if (!a->selected[id] || a->checked[id] != 1) continue;
+            const vgeo2::Cluster& c = a->clusters[id];
+            const uint32_t* idx = a->indices + c.index_offset;
+            for (uint32_t t = 0; t < c.tri_count; ++t) {
+                uint32_t m = std::min<uint32_t>(a->vmat[idx[t * 3]], M - 1);
+                uint32_t* dst = a->out_gidx.data() + at[m];
+                dst[0] = idx[t * 3]; dst[1] = idx[t * 3 + 1]; dst[2] = idx[t * 3 + 2];
+                at[m] += 3;
+            }
+        }
+    }
+    if (material_offsets)
+        for (uint32_t m = 0; m <= material_count; ++m) material_offsets[m] = counts[std::min(m, M)];
+    *indices = a->out_gidx.data();
+    *index_count = uint32_t(a->out_gidx.size());
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_chunk_indices(void* handle, uint32_t chunk, const uint32_t** indices,
+                                           uint32_t* index_count, uint32_t* material_offsets,
+                                           uint32_t material_count) {
+    return vgeo_range_indices(handle, chunk, 1, indices, index_count, material_offsets, material_count);
 }

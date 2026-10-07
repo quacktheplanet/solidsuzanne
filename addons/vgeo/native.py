@@ -163,6 +163,17 @@ def lib():
         L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
                                             c.c_char_p, c.c_int]
         L.vgeo_export_web_paged.restype = c.c_int
+    if hasattr(L, "vgeo_chunk_indices"):  # live drawing
+        P = c.POINTER
+        L.vgeo_vertex_arrays.argtypes = [c.c_void_p, P(P(c.c_float)), P(P(c.c_float)), P(P(c.c_float)),
+                                         P(P(c.c_uint16)), P(c.c_uint32)]
+        L.vgeo_vertex_arrays.restype = c.c_int
+        L.vgeo_chunk_indices.argtypes = [c.c_void_p, c.c_uint32, P(P(c.c_uint32)), P(c.c_uint32),
+                                         P(c.c_uint32), c.c_uint32]
+        L.vgeo_chunk_indices.restype = c.c_int
+        L.vgeo_range_indices.argtypes = [c.c_void_p, c.c_uint32, c.c_uint32, P(P(c.c_uint32)), P(c.c_uint32),
+                                         P(c.c_uint32), c.c_uint32]
+        L.vgeo_range_indices.restype = c.c_int
     if hasattr(L, "vgeo_extra_desc"):  # library version 3
         L.vgeo_extra_desc.argtypes = [c.c_void_p, c.c_char_p, c.c_int]
         L.vgeo_extra_desc.restype = c.c_int
@@ -416,6 +427,52 @@ class Asset:
         if rc != 0:
             raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_export_web failed")
         return size.value
+
+    def vertex_arrays(self):
+        """Copies of the whole asset's vertex arrays (positions, normals, uvs or None, vmat), for uploading
+        every vertex to the GPU once (live drawing)."""
+        L = lib()
+        c = ctypes
+        pp, pn, pu = c.POINTER(c.c_float)(), c.POINTER(c.c_float)(), c.POINTER(c.c_float)()
+        pm = c.POINTER(c.c_uint16)()
+        n = c.c_uint32(0)
+        if L.vgeo_vertex_arrays(self._h, c.byref(pp), c.byref(pn), c.byref(pu), c.byref(pm), c.byref(n)) != 0:
+            raise RuntimeError("vgeo_vertex_arrays failed")
+        nv = n.value
+
+        def grab(ptr, count, dtype):
+            out = np.empty(count, dtype=dtype)
+            ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
+            return out
+        return (grab(pp, nv * 3, np.float32).reshape(nv, 3), grab(pn, nv * 3, np.float32).reshape(nv, 3),
+                grab(pu, nv * 2, np.float32).reshape(nv, 2) if pu else None, grab(pm, nv, np.uint16))
+
+    def range_indices(self, first, count, material_count):
+        """chunk_indices for chunks [first, first + count) at once."""
+        c = ctypes
+        ptr = c.POINTER(c.c_uint32)()
+        n = c.c_uint32(0)
+        offs = (c.c_uint32 * (material_count + 1))()
+        if lib().vgeo_range_indices(self._h, first, count, c.byref(ptr), c.byref(n), offs, material_count) != 0:
+            raise RuntimeError("vgeo_range_indices failed")
+        out = np.empty(n.value, np.uint32)
+        if n.value:
+            ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
+        return out, np.array(offs[:], dtype=np.int64)
+
+    def chunk_indices(self, chunk, material_count):
+        """The chunk's selected triangles as global vertex indices (uint32, copied), grouped by material,
+        and material_count + 1 offsets into them."""
+        c = ctypes
+        ptr = c.POINTER(c.c_uint32)()
+        n = c.c_uint32(0)
+        offs = (c.c_uint32 * (material_count + 1))()
+        if lib().vgeo_chunk_indices(self._h, chunk, c.byref(ptr), c.byref(n), offs, material_count) != 0:
+            raise RuntimeError("vgeo_chunk_indices failed")
+        out = np.empty(n.value, np.uint32)
+        if n.value:
+            ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
+        return out, np.array(offs[:], dtype=np.int64)
 
     def extract(self, chunk):
         """Return numpy copies of one chunk's selected geometry (None if empty)."""

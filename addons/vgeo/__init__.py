@@ -330,6 +330,14 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.label(text="Native library missing", icon='ERROR')
             layout.label(text=native.library_path())
             return
+        from . import livedraw
+        row = layout.row(align=True)
+        row.prop(context.scene, "vgeo_live_draw", toggle=True, icon='SHADING_TEXTURE')
+        if context.scene.vgeo_live_draw:
+            if livedraw.is_active():
+                layout.label(text=f"Drawing {livedraw.drawn_triangles():,} triangles", icon='INFO')
+            else:
+                layout.label(text="Off while a view is in Rendered shading", icon='INFO')
         if ob is not None and ob.vgeo_inst.uid:
             vi = ob.vgeo_inst
             box = layout.box()
@@ -399,13 +407,23 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Object.vgeo = PointerProperty(type=VGEOObjectSettings)
     bpy.types.Object.vgeo_inst = PointerProperty(type=VGEOInstanceSettings)
+    bpy.types.Scene.vgeo_live_draw = BoolProperty(
+        name="Live Draw", default=True,
+        description="Draw virtualized assets straight from GPU buffers in Solid and Material Preview views "
+                    "(fast, view-dependent cuts for every copy). Final renders and Rendered views use EEVEE "
+                    "or Cycles with real meshes either way")
     bpy.types.VIEW3D_MT_object.append(_menu)
     stream.register()
+    from . import livedraw
+    livedraw.register()
 
 
 def unregister():
+    from . import livedraw
+    livedraw.unregister()
     stream.unregister()
     bpy.types.VIEW3D_MT_object.remove(_menu)
+    del bpy.types.Scene.vgeo_live_draw
     del bpy.types.Object.vgeo_inst
     del bpy.types.Object.vgeo
     for c in reversed(classes):
