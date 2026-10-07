@@ -110,7 +110,7 @@ def build_levels(inst, source):
     path = stream.asset_path(source)
     asset = native.Asset(path)   # own handle: never disturbs the proxy's live selection
     try:
-        errors = asset.level_errors()
+        depth_errors = asset.level_errors()
         uid = inst.vgeo_inst.uid
         col = inst.vgeo_inst.levels
         if col is None:
@@ -122,16 +122,16 @@ def build_levels(inst, source):
             if me is not None and me.users == 0:
                 bpy.data.meshes.remove(me)
         materials = tuple(source.data.materials)
-        tris = []
-        for depth in range(len(errors)):
-            name = f"vgeo.{uid}.L{depth:02d}"
+        tris, errors = [], []
+        for level, (err, data) in enumerate(_error_levels(asset, depth_errors)):
+            name = f"vgeo.{uid}.L{level:02d}"
             me = bpy.data.meshes.new(name)
             stream._sync_materials(me, materials)
-            data = asset.level_mesh_data(depth)
             stream.fill_mesh(me, data, materials, False)
             ob = bpy.data.objects.new(name, me)
             col.objects.link(ob)
             tris.append(data["tri_count"] if data else 0)
+            errors.append(err)
         lo, hi = np.array(asset.info["aabb_min"]), np.array(asset.info["aabb_max"])
         center = (lo + hi) / 2
         inst["vgeo_level_errors"] = [float(e) for e in errors]
@@ -142,6 +142,34 @@ def build_levels(inst, source):
     finally:
         asset.close()
     _attach(inst)
+
+
+LEVEL_STEP = 2.0     # each level allows twice the error of the one before
+
+
+def _error_levels(asset, depth_errors):
+    """(error, mesh data) per level: level 0 is the full asset, then the cheapest crack-free cut whose
+    error stays under e, 2e, 4e, ... up to the coarsest. Uniform DAG depths took the worst cluster's error
+    for the whole level (a displaced rock's depth 5 was 476k triangles for 7.7 mm, depth 6 jumped to
+    4.6 cm), so copies sat at needlessly fine levels: ~80 triangles per pixel in a 1,000-copy field."""
+    finite = sorted(e for e in depth_errors if 0 < e < 1e30)
+    if not finite:
+        for depth in range(len(depth_errors)):
+            yield depth_errors[depth], asset.level_mesh_data(depth)
+        return
+    yield 0.0, asset.level_mesh_data(0)
+    e, last_tris = finite[0] / LEVEL_STEP, None
+    top = finite[-1] * LEVEL_STEP
+    while e <= top:
+        data = asset.error_cut_mesh_data(e)
+        n = data["tri_count"] if data else 0
+        if n and n != last_tris:
+            yield e, data
+            last_tris = n
+        e *= LEVEL_STEP
+    coarsest = asset.level_mesh_data(len(depth_errors) - 1)
+    if coarsest and coarsest["tri_count"] != last_tris:
+        yield max(top, depth_errors[-1] if depth_errors[-1] < 1e30 else top), coarsest
 
 
 def _attach(inst):
@@ -240,10 +268,40 @@ def triangles_for(inst, levels, streamed=None):
     return int(tris[levels].sum())
 
 
-def update(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, render=False):
+MIN_INTERVAL = 0.2   # s between level writes while the view moves (each write re-evaluates the instancer)
+_last_write = {}     # instancer uid -> perf_counter of its last level write
+
+
+def _settle(inst, levels):
+    """Viewport only: refine at once wherever a copy is too coarse, but coarsen a copy only once it's two
+    levels finer than needed, and write at most every MIN_INTERVAL. Flying through a 1,000-copy field,
+    some copy crossed a level boundary nearly every tick, and every write re-evaluated the instancer
+    (~45 ms a frame in EEVEE/Solid, against 27 ms for drawing it)."""
+    import time
+    me = inst.data
+    a = me.attributes.get(LEVEL_ATTR)
+    if a is None or a.domain != 'POINT' or a.data_type != 'INT' or len(a.data) != len(levels):
+        return levels
+    cur = np.empty(len(levels), np.int32)
+    a.data.foreach_get("value", cur)
+    keep = (cur <= levels) & (cur >= levels - 1)       # fine enough and at most one level too fine
+    out = np.where(keep, cur, levels).astype(np.int32)
+    if not np.array_equal(out, cur):
+        now = time.perf_counter()
+        uid = inst.vgeo_inst.uid
+        if now - _last_write.get(uid, 0.0) < MIN_INTERVAL:
+            return cur
+        _last_write[uid] = now
+    return out
+
+
+def update(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, render=False, live=False):
     """Choose levels and streamed copies for these views. render=True: the streamed copies get
-    their cut now and take over at once (final renders are synchronous)."""
+    their cut now and take over at once (final renders are synchronous). live=True (the viewport loop):
+    level changes settle (see _settle) instead of landing every tick."""
     levels, budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
+    if live and not render:
+        levels = _settle(inst, levels)
     changed = apply_levels(inst, levels)
     wanted = _wanted_slots(inst, levels, budget)
     changed |= assign_slots(inst, wanted, views if render else None, pixel_error, mode, offscreen_scale)
@@ -335,12 +393,14 @@ def _remove_slot(ob):
 
 
 def _wanted_slots(inst, levels, budget):
-    """Placements that should be streamed: they want the finest level and it is big, nearest first."""
+    """Placements that should be streamed: the level they want is a big whole-asset mesh (a view-dependent
+    cut of their own is lighter), nearest first. With error-based levels a near copy wants a fine level
+    rather than exactly level 0, so the test is the level's size, not its number."""
     k = int(inst.vgeo_inst.stream_slots)
     _errors, tris = _level_tables(inst)
     if k <= 0 or not len(levels) or tris[0] < STREAM_MIN_TRIS or int(inst.vgeo_inst.min_level) > 0:
         return []
-    cand = np.nonzero(levels == 0)[0]
+    cand = np.nonzero(np.asarray(tris)[levels] >= STREAM_MIN_TRIS)[0]
     if not len(cand):
         return []
     return [int(i) for i in cand[np.argsort(budget[cand], kind="stable")][:k]]
@@ -393,7 +453,7 @@ def _clear_fronts(ob):
         for c in pair:
             if len(c.data.vertices):
                 c.data.clear_geometry()
-    rt.invalidate()
+    rt.invalidate(keep_objects=True)
 
 
 def _release_slot(inst, ob, flags=None):
@@ -424,7 +484,8 @@ def assign_slots(inst, wanted, render_views=None, pixel_error=1.0, mode="COARSEN
         if i in wanted_set and i not in kept:
             kept.add(i)
         else:
-            _release_slot(inst, ob, flags)
+            if i >= 0:                     # an idle copy is already empty: releasing it again every
+                _release_slot(inst, ob, flags)   # tick emptied hundreds of chunks for nothing
             free.append(ob)
     for i in [i for i in wanted if i not in kept]:
         if not free:

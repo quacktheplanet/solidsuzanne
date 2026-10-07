@@ -258,6 +258,39 @@ Real scans (Poly Haven, 4K albedo + normal + roughness, EEVEE and Cycles, RTX 50
 | Moon rock displaced into 15.3M real triangles | 11.5 s / 15.7 s | 2.9 s / 4.4 s | mean 0.49 / 0.54 |
 | 1,000 scattered copies of it: 15.3 billion source triangles | (not renderable) | 4.0 s / 4.7 s | |
 
+## A 15-billion-triangle field in the viewport (RTX 5090, 5.1.2, Xvfb window)
+
+1,000 scattered copies of the 15.3M-triangle displaced rock, flown through in the viewport
+(`tests/viewport_bench.py`-style flight, frame times from draw handler timestamps):
+
+| | Before | After |
+|---|---|---|
+| Live-loop tick | 120-220 ms | 16-19 ms |
+| Solid, flying | 3.8 fps (260 ms) | ~13-15 fps (66-78 ms) |
+| EEVEE Material Preview, flying | 2-3 fps | ~25 fps (39 ms median) |
+| Same view frozen (no streaming): Solid / EEVEE | | 27 / 34 ms |
+| Triangles on screen | 120M | 99-107M |
+
+What it took:
+- **Chunk lookups.** Idle streamed copies were "released" again every tick, which dropped their chunk
+  cache, and rebuilding it looked up each chunk by name in `bpy.data.objects` (a scan of every object):
+  95k lookups, 8.8 of 10.8 profiled seconds. Idle copies are left alone, emptying keeps the cache, and
+  lookups go through the chunk collection.
+- **Error-based instance levels.** Levels were uniform DAG depths, whose error is the worst cluster's: the
+  rock's depth 5 was 476k triangles at 7.7 mm and depth 6 jumped to 4.6 cm, so most copies sat at depth 5.
+  Levels are now the cheapest crack-free cut under an error that doubles per level (ortho select). Copies
+  wanting a level of 20k+ triangles (not just level 0) get the streamed copies.
+- **Settling.** In the live loop, a copy refines at once but coarsens only when two levels too fine, and
+  level writes happen at most every 0.2 s. EEVEE views now update cuts once the view is still (like Cycles):
+  streaming near copies while flying cost EEVEE ~200 ms a frame.
+
+Still far from Nanite here: ~100M triangles are drawn because a copy is a whole-rock level (no per-cluster
+back-face or occlusion culling), and every changed mesh costs Blender a buffer rebuild. Getting to
+Nanite-like interactivity in the viewport needs drawing the clusters ourselves on the GPU (culling per
+cluster, one indirect draw), as the web viewer already does, with EEVEE/Cycles for final renders.
+`tests/slot_gui_check.py` in Solid now switches copies (it timed out before) but not yet the one in front
+of the camera within its window.
+
 ## Not yet
 
 - A streamed copy's first assignment creates its chunk objects (one

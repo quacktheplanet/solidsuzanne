@@ -359,6 +359,16 @@ class Asset:
     def level_mesh_data(self, depth):
         """The whole asset at one uniform level, as one chunk-style dict (for instancing)."""
         self.select_level(depth)
+        return self._whole_cut()
+
+    def error_cut_mesh_data(self, max_error):
+        """The cheapest crack-free cut of the whole asset whose error stays under max_error (asset units),
+        as one chunk-style dict. Unlike a uniform DAG depth, it keeps coarse clusters wherever they are
+        good enough, so the triangles go where the shape needs them."""
+        self.select([make_view((0.0, 0.0, 0.0), 1.0, 0.01, float(max_error), ortho=True, ortho_height=1.0)])
+        return self._whole_cut()
+
+    def _whole_cut(self):
         parts = [d for d in (self.extract(c) for c in range(self.chunk_count)) if d]
         if not parts:
             return None

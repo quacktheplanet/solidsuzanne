@@ -444,7 +444,8 @@ def run():
     check("scatter creates an instancer", rc == {'FINISHED'} and inst.vgeo_inst.uid and len(inst.data.vertices) == 400)
     errs = list(inst["vgeo_level_errors"])
     lvl_tris = list(inst["vgeo_level_tris"])
-    check("one level mesh per LOD level", len(inst.vgeo_inst.levels.objects) == len(errs) == rt.asset.info["lod_levels"],
+    check("a level mesh per error level, full detail to coarsest",
+          len(inst.vgeo_inst.levels.objects) == len(errs) >= 3 and lvl_tris[0] == rt.asset.info["source_triangles"],
           f"{len(errs)} levels, {lvl_tris[0]:,} -> {lvl_tris[-1]:,} tris")
     check("level errors grow, triangles shrink", all(a <= b for a, b in zip(errs, errs[1:]))
           and all(a >= b for a, b in zip(lvl_tris, lvl_tris[1:])) and errs[0] == 0.0)

@@ -87,11 +87,14 @@ class Runtime:
         self.spare_clear = set()
         self.chunk_cache = None
 
-    def invalidate(self):
+    def invalidate(self, keep_objects=False):
+        """Forget the current cut. keep_objects: the chunk objects are still the same (emptying a
+        streamed copy), so keep the cache of them; rebuilding it looks up hundreds of objects by name."""
         if self.asset:
             self.valid[:] = False
             self.key = None
-            self.chunk_cache = None
+            if not keep_objects:
+                self.chunk_cache = None
             _discard_pending(self)
 
     def close(self):
@@ -180,10 +183,12 @@ def chunk_objects(obj, rt):
         col = bpy.data.collections.new(f".vgeo {obj.vgeo.uid}")
         obj.vgeo.collection = col
     link_chunks(obj)
-    members = set(col.objects.keys())
+    # the chunks live in their own collection: look them up there (bpy.data.objects.get scans every
+    # object in the file; with 1,000-copy scenes that was 0.1 ms a call, 200+ ms a tick)
+    members = {o.name: o for o in col.objects}
 
     def get(name, shown):
-        ob = bpy.data.objects.get(name)
+        ob = members.get(name) or bpy.data.objects.get(name)
         if ob is None or ob.type != 'MESH':
             ob = bpy.data.objects.new(name, bpy.data.meshes.new(name))
             _set_shown(ob, shown)
@@ -363,9 +368,11 @@ def viewport_views():
 def viewport_strategy():
     """How the live loop should land updates, given what the 3D views show.
 
-    CYCLES: some view renders with Cycles (update once the view settles)
-    STAGED: everything else. EEVEE used to need BATCH (see the module notes);
-            with chunks as separate objects, staging is about 4x cheaper there.
+    CYCLES: some view renders with Cycles, or with EEVEE (Material Preview or Rendered): update once the
+            view settles. EEVEE redraws a 1,000-copy field at ~30 fps when nothing changes, but streaming
+            the near copies while flying cost 200 ms a frame (shadows and buffers of every changed mesh are
+            redone), so the cut stays put while the view moves and lands when it stops.
+    STAGED: Solid and Wireframe.
     """
     for win in bpy.context.window_manager.windows:
         if win.screen is None:
@@ -374,7 +381,9 @@ def viewport_strategy():
         for area in win.screen.areas:
             if area.type != 'VIEW_3D':
                 continue
-            if area.spaces.active.shading.type == 'RENDERED' and engine == 'CYCLES':
+            shading = area.spaces.active.shading.type
+            if shading == 'MATERIAL' or (shading == 'RENDERED' and engine in ('CYCLES', 'BLENDER_EEVEE_NEXT',
+                                                                             'BLENDER_EEVEE')):
                 return 'CYCLES'
     return 'STAGED'
 
@@ -918,7 +927,7 @@ def _tick():
         for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
             try:
                 if vl is None or inst.visible_get(view_layer=vl):
-                    instances.update(inst, views, inst.vgeo_inst.pixel_error)
+                    instances.update(inst, views, inst.vgeo_inst.pixel_error, live=True)
             except RuntimeError:
                 continue
         if not objs:
