@@ -150,7 +150,8 @@ def _attach(inst):
     if mod is None:
         mod = inst.modifiers.new("VGEO Instances", 'NODES')
         mod.node_group = ng
-    mod[_socket_id(ng, "Levels")] = inst.vgeo_inst.levels
+    from . import mod_inputs
+    mod_inputs.of(mod)[_socket_id(ng, "Levels")] = inst.vgeo_inst.levels
 
 
 def _level_tables(inst):
