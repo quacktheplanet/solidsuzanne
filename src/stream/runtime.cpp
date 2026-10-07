@@ -73,6 +73,9 @@ struct Asset {
     const float* positions = nullptr;
     const float* normals = nullptr;
     const float* uvs = nullptr;
+    const float* extras = nullptr;     // version 3: extra_count floats per vertex
+    uint32_t extra_count = 0;
+    std::string extra_desc;
     const uint16_t* vmat = nullptr;
     const uint32_t* indices = nullptr;
     const vgeo2::Cluster* clusters = nullptr;
@@ -95,7 +98,7 @@ struct Asset {
     // (per-vertex arrays would cost 8 bytes per vertex of the asset, per handle)
     std::vector<uint32_t> remap_key;
     std::vector<int32_t> remap_val;
-    std::vector<float> out_pos, out_nrm, out_uv;
+    std::vector<float> out_pos, out_nrm, out_uv, out_extra;
     std::vector<int32_t> out_corner, out_mat, out_lod;
     std::vector<int32_t> out_edges, out_corner_edge;
     std::vector<uint64_t> edge_keys;
@@ -279,13 +282,26 @@ extern "C" VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_le
         && section_ok(*a, h.off_groups, uint64_t(h.group_count) * sizeof(vgeo2::Group))
         && section_ok(*a, h.off_chunks, uint64_t(h.chunk_count) * sizeof(vgeo2::Chunk))
         && section_ok(*a, h.off_chunk_clusters, uint64_t(h.chunk_cluster_count) * 4)
-        && section_ok(*a, h.off_materials, 4);
+        && section_ok(*a, h.off_materials, 4)
+        && (!h.reserved[vgeo2::kExtraOffset] || (h.reserved[vgeo2::kExtraCount] > 0 && h.reserved[vgeo2::kExtraCount] < 256
+            && section_ok(*a, h.reserved[vgeo2::kExtraOffset], uint64_t(h.vertex_count) * h.reserved[vgeo2::kExtraCount] * 4)))
+        && (!h.reserved[vgeo2::kExtraDesc] || section_ok(*a, h.reserved[vgeo2::kExtraDesc], 4));
     if (!ok) { delete a; set_err(err, err_len, "corrupt file (section out of range)"); return nullptr; }
 
     const uint8_t* b = a->base;
     a->positions = reinterpret_cast<const float*>(b + h.off_positions);
     a->normals = reinterpret_cast<const float*>(b + h.off_normals);
     a->uvs = (h.flags & vgeo2::kHasUVs) ? reinterpret_cast<const float*>(b + h.off_uvs) : nullptr;
+    if (h.reserved[vgeo2::kExtraOffset]) {
+        a->extras = reinterpret_cast<const float*>(b + h.reserved[vgeo2::kExtraOffset]);
+        a->extra_count = uint32_t(h.reserved[vgeo2::kExtraCount]);
+    }
+    if (h.reserved[vgeo2::kExtraDesc]) {
+        uint32_t len = 0;
+        std::memcpy(&len, b + h.reserved[vgeo2::kExtraDesc], 4);
+        if (section_ok(*a, h.reserved[vgeo2::kExtraDesc], 4 + uint64_t(len)))
+            a->extra_desc.assign(reinterpret_cast<const char*>(b + h.reserved[vgeo2::kExtraDesc] + 4), len);
+    }
     a->vmat = reinterpret_cast<const uint16_t*>(b + h.off_vmat);
     a->indices = reinterpret_cast<const uint32_t*>(b + h.off_indices);
     a->clusters = reinterpret_cast<const vgeo2::Cluster*>(b + h.off_clusters);
@@ -348,6 +364,7 @@ extern "C" VGEO_API int vgeo_get_info(void* handle, vgeo_info* info) {
     info->source_triangles = a->h.source_triangles;
     std::memcpy(info->aabb_min, a->h.aabb_min, sizeof(info->aabb_min));
     std::memcpy(info->aabb_max, a->h.aabb_max, sizeof(info->aabb_max));
+    info->extra_count = a->extra_count;
     return 0;
 }
 
@@ -409,7 +426,7 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     if (!a || !out || chunk >= a->h.chunk_count) return 1;
     const vgeo2::Chunk& ch = a->chunks[chunk];
 
-    a->out_pos.clear(); a->out_nrm.clear(); a->out_uv.clear();
+    a->out_pos.clear(); a->out_nrm.clear(); a->out_uv.clear(); a->out_extra.clear();
     a->out_corner.clear(); a->out_mat.clear(); a->out_lod.clear();
 
     uint64_t corners = 0;
@@ -440,6 +457,10 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
                     a->out_pos.insert(a->out_pos.end(), a->positions + size_t(v) * 3, a->positions + size_t(v) * 3 + 3);
                     a->out_nrm.insert(a->out_nrm.end(), a->normals + size_t(v) * 3, a->normals + size_t(v) * 3 + 3);
                     if (a->uvs) a->out_uv.insert(a->out_uv.end(), a->uvs + size_t(v) * 2, a->uvs + size_t(v) * 2 + 2);
+                    if (a->extras) {
+                        const float* e = a->extras + size_t(v) * a->extra_count;
+                        a->out_extra.insert(a->out_extra.end(), e, e + a->extra_count);
+                    }
                 }
                 a->out_corner.push_back(a->remap_val[slot]);
             }
@@ -456,6 +477,8 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     out->positions = a->out_pos.data();
     out->normals = a->out_nrm.data();
     out->uvs = a->uvs ? a->out_uv.data() : nullptr;
+    out->extra_count = a->extra_count;
+    out->extras = a->extras ? a->out_extra.data() : nullptr;
     out->corner_verts = a->out_corner.data();
     out->face_materials = a->out_mat.data();
     out->face_lod = a->out_lod.data();
@@ -495,6 +518,7 @@ extern "C" VGEO_API int vgeo_prefetch(void* handle, const uint32_t* chunks, int 
                 add(h.off_positions + v0 * 12, n * 12);
                 add(h.off_normals + v0 * 12, n * 12);
                 if (a->uvs) add(h.off_uvs + v0 * 8, n * 8);
+                if (a->extras) add(h.reserved[vgeo2::kExtraOffset] + v0 * a->extra_count * 4, n * a->extra_count * 4);
                 add(h.off_vmat + v0 * 2, n * 2);
             }
         }
@@ -509,7 +533,7 @@ extern "C" VGEO_API int vgeo_memory(void* handle, uint64_t* mapped_bytes, uint64
     uint64_t heap = a->owned.capacity() + a->group_pass.capacity() + a->selected.capacity()
         + a->checked.capacity() + (a->vmin.capacity() + a->vmax.capacity()) * 4
         + (a->remap_key.capacity() + a->remap_val.capacity()) * 4
-        + (a->out_pos.capacity() + a->out_nrm.capacity() + a->out_uv.capacity()) * 4
+        + (a->out_pos.capacity() + a->out_nrm.capacity() + a->out_uv.capacity() + a->out_extra.capacity()) * 4
         + (a->out_corner.capacity() + a->out_mat.capacity() + a->out_lod.capacity()) * 4
         + (a->out_edges.capacity() + a->out_corner_edge.capacity() + a->edge_ids.capacity()) * 4
         + a->edge_keys.capacity() * 8;
@@ -1013,4 +1037,15 @@ extern "C" VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf
     }
     if (out_bytes) *out_bytes = w.file_size;
     return 0;
+}
+
+extern "C" VGEO_API int vgeo_extra_desc(void* handle, char* buf, int buf_len) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a) return 0;
+    if (buf && buf_len > 0) {
+        size_t n = std::min(a->extra_desc.size(), size_t(buf_len - 1));
+        std::memcpy(buf, a->extra_desc.data(), n);
+        buf[n] = 0;
+    }
+    return int(a->extra_desc.size());
 }

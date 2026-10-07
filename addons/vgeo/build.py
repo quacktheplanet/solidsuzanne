@@ -42,6 +42,7 @@ def mesh_arrays(obj, depsgraph):
             uv = np.empty(C * 2, np.float32)
             layer.data.foreach_get("uv", uv)
             uv = uv.reshape(-1, 2)
+        extras, desc = _extra_channels(me, cv, uv_name=layer.name if layer is not None else "UVMap")
         pm = np.empty(len(me.polygons), np.int32)
         me.polygons.foreach_get("material_index", pm)
         mat_list = evaluated_materials(obj, ev, me)
@@ -56,13 +57,77 @@ def mesh_arrays(obj, depsgraph):
         vn = cn[first]
         smooth = np.allclose(cn, vn[cv], atol=1e-5)
         seamless = uv is None or np.allclose(uv, uv[first][cv], atol=1e-6)
+        if extras is not None:
+            seamless = seamless and np.allclose(extras, extras[first][cv], atol=1e-6)
         if smooth and seamless:
             return {"positions": co, "normals": vn, "uvs": None if uv is None else uv[first],
-                    "materials": materials, "indices": cv[tl].astype(np.uint32), "material_list": mat_list}
+                    "materials": materials, "indices": cv[tl].astype(np.uint32), "material_list": mat_list,
+                    "extras": None if extras is None else extras[first], "extra_desc": desc}
         return {"positions": co[cv[tl]], "normals": cn[tl], "uvs": None if uv is None else uv[tl],
-                "materials": materials, "indices": None, "material_list": mat_list}
+                "materials": materials, "indices": None, "material_list": mat_list,
+                "extras": None if extras is None else extras[tl], "extra_desc": desc}
     finally:
         ev.to_mesh_clear()
+
+
+# what a material can read besides the active UV map, carried into every cut (library version 3)
+_EXTRA_KINDS = {"FLOAT2": ("vector", 2), "FLOAT_COLOR": ("color", 4), "BYTE_COLOR": ("color", 4),
+                "FLOAT": ("value", 1), "FLOAT_VECTOR": ("vector", 3)}
+_SKIP_ATTRS = {"position", "material_index", "sharp_face", "sharp_edge", "custom_normal", "crease_vert",
+               "crease_edge", "bevel_weight_vert", "bevel_weight_edge"}
+MAX_EXTRA_FLOATS = 64
+
+
+def _extra_channels(me, cv, uv_name="UVMap"):
+    """(per-corner float array or None, JSON description) of the mesh's other UV maps and its colour and
+    float attributes on points or corners, plus the active UV's name and the texture space (so Generated
+    coordinates match on every streamed chunk). Points are spread to their corners."""
+    import json
+    C = len(me.loops)
+    cols, channels, off = [], [], 0
+    active = me.uv_layers.active
+    uv_names = {l.name for l in me.uv_layers}
+    render_uv = next((l.name for l in me.uv_layers if l.active_render), uv_name)
+    for l in me.uv_layers:
+        if l == active:
+            continue
+        a = np.empty(C * 2, np.float32)
+        l.data.foreach_get("uv", a)
+        cols.append(a.reshape(-1, 2))
+        channels.append({"name": l.name, "type": "FLOAT2", "size": 2, "offset": off, "uv": True})
+        off += 2
+    ac = getattr(me.color_attributes, "active_color_name", "") or ""
+    rc_index = getattr(me.color_attributes, "render_color_index", -1)
+    render_col = me.color_attributes[rc_index].name if 0 <= rc_index < len(me.color_attributes) else ""
+    color_names = {c.name for c in me.color_attributes}
+    for at in me.attributes:
+        if (at.name in uv_names or at.name in _SKIP_ATTRS or at.name.startswith(".")
+                or getattr(at, "is_internal", False) or at.domain not in ("POINT", "CORNER")
+                or at.data_type not in _EXTRA_KINDS):
+            continue
+        prop, n = _EXTRA_KINDS[at.data_type]
+        if off + n > MAX_EXTRA_FLOATS:
+            print(f"VGEO: '{at.name}' left out (more than {MAX_EXTRA_FLOATS} floats of extra data)")
+            continue
+        count = len(me.vertices) if at.domain == "POINT" else C
+        a = np.empty(count * n, np.float32)
+        at.data.foreach_get(prop, a)
+        a = a.reshape(-1, n)
+        if at.domain == "POINT":
+            a = a[cv]
+        cols.append(a)
+        is_color = at.name in color_names
+        channels.append({"name": at.name, "type": "FLOAT_COLOR" if is_color else at.data_type, "size": n,
+                         "offset": off, "color": is_color})
+        off += n
+    try:
+        texspace = [list(me.texspace_location), list(me.texspace_size)]
+    except AttributeError:
+        texspace = None
+    desc = {"uv_name": uv_name, "render_uv": render_uv, "channels": channels, "active_color": ac,
+            "render_color": render_col, "texspace": texspace}
+    extras = np.ascontiguousarray(np.hstack(cols), dtype=np.float32) if cols else None
+    return extras, json.dumps(desc)
 
 
 def evaluated_materials(obj, ev, me):
@@ -146,7 +211,8 @@ class Job:
             self.result = native.build(self.path, a["positions"], a["normals"], a["uvs"], a["materials"],
                                        self.material_names, max_triangles=self.max_triangles,
                                        target_chunks=self.target_chunks, progress=self._progress,
-                                       indices=a["indices"], material_params=self.material_params)
+                                       indices=a["indices"], material_params=self.material_params,
+                                       extras=a.get("extras"), extra_desc=a.get("extra_desc", ""))
         except BaseException as e:
             self.error = e
         finally:

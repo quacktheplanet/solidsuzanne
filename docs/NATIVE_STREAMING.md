@@ -230,6 +230,34 @@ chosen so a WebGPU runtime can read the same file: the selection rule is the
 same few lines, and `vgeo_stream` can be compiled to WebAssembly for the
 cut selection if needed.
 
+## Materials see what they saw before (library version 3)
+
+A streamed chunk is its own mesh, so anything a material reads has to travel with the geometry. Besides
+positions, normals, the active UV map and material slots, a .vgeo now carries:
+
+- **every other UV map** and **colour and float attributes** on points or corners (up to 64 floats per
+  vertex), welded with the rest (a seam in a second UV map splits vertices like a seam in the first) and
+  protected from simplification (vertices on such seams are flagged `meshopt_SimplifyVertex_Protect`);
+- **the active UV map's own name** (materials whose UV Map node names it kept working only for "UVMap")
+  and which maps and colours are active and render-active;
+- **the texture space**: each chunk gets the source's, so Generated coordinates line up across chunks
+  instead of being fitted to every chunk.
+
+They live in the format's reserved header fields (extra data and a JSON description), so older files open
+as before and older libraries ignore the new build fields. `tests/test_material_inputs.py` renders each
+input before and after Virtualize Mesh (mean difference 0.16-0.44/255) and checks Scatter's level meshes.
+Before: Generated-coordinate checkers were scrambled per chunk, a second UV map rendered untextured, colour
+attributes rendered black.
+
+Real scans (Poly Haven, 4K albedo + normal + roughness, EEVEE and Cycles, RTX 5090, 5.1.2):
+
+| | Original | VGEO | Difference |
+|---|---|---|---|
+| Coastal cliff, 1.54M triangles, wide shot | 2.6 s / 6.0 s | 1.9 s / 3.8 s, 571k-triangle cut | mean 0.27 / 0.33 of 255 |
+| Same, close-up | 2.6 s / 4.6 s | 1.6 s / 3.9 s | mean 0.00 / 0.03 |
+| Moon rock displaced into 15.3M real triangles | 11.5 s / 15.7 s | 2.9 s / 4.4 s | mean 0.49 / 0.54 |
+| 1,000 scattered copies of it: 15.3 billion source triangles | (not renderable) | 4.0 s / 4.7 s | |
+
 ## Not yet
 
 - A streamed copy's first assignment creates its chunk objects (one

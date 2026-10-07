@@ -121,6 +121,9 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
     const size_t corner_count = size_t(in->tri_count) * 3;
+    // more per-vertex data (more UV maps, colours), welded and seam-protected like the UVs
+    const size_t E = (in->extras && in->extra_count) ? size_t(in->extra_count) : 0;
+    std::vector<float> extras;
     if (report(0, 0.f)) { set_err(err, err_len, "cancelled"); return 2; }
 
     if (in->indices) {
@@ -142,6 +145,7 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
             v.v = in->uvs ? in->uvs[i * 2 + 1] : 0.f;
             v.mat = -1.f;  // unassigned
         }
+        if (E) extras.assign(in->extras, in->extras + vc * E);
         indices.assign(in->indices, in->indices + corner_count);
         std::vector<std::pair<uint64_t, unsigned>> splits;  // (vertex<<16 | mat) -> new vertex
         for (size_t i = 0; i < corner_count; ++i) {
@@ -160,10 +164,12 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
             for (auto& s : splits) {
                 if (s.first != last) {
                     last = s.first;
-                    Vertex copy = vertices[size_t(s.first >> 16)];
+                    const size_t src = size_t(s.first >> 16);
+                    Vertex copy = vertices[src];
                     copy.mat = float(s.first & 0xFFFF);
                     nv = unsigned(vertices.size());
                     vertices.push_back(copy);
+                    for (size_t k = 0; k < E; ++k) extras.push_back(extras[src * E + k]);
                 }
                 indices[s.second] = nv;
             }
@@ -217,8 +223,18 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
             }
         }
         std::vector<unsigned int> remap(corner_count);
-        size_t vertex_count = meshopt_generateVertexRemap(remap.data(), nullptr, corner_count,
-                                                          corners.data(), corner_count, sizeof(Vertex));
+        size_t vertex_count;
+        if (E) {
+            const meshopt_Stream streams[2] = {{corners.data(), sizeof(Vertex), sizeof(Vertex)},
+                                               {in->extras, E * sizeof(float), E * sizeof(float)}};
+            vertex_count = meshopt_generateVertexRemapMulti(remap.data(), nullptr, corner_count, corner_count,
+                                                            streams, 2);
+            extras.resize(vertex_count * E);
+            meshopt_remapVertexBuffer(extras.data(), in->extras, corner_count, E * sizeof(float), remap.data());
+        } else {
+            vertex_count = meshopt_generateVertexRemap(remap.data(), nullptr, corner_count,
+                                                       corners.data(), corner_count, sizeof(Vertex));
+        }
         vertices.resize(vertex_count);
         meshopt_remapVertexBuffer(vertices.data(), corners.data(), corner_count, sizeof(Vertex), remap.data());
         indices.swap(remap);  // identity index buffer remapped == remap itself
@@ -255,6 +271,21 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     mesh.attribute_count = 3;
     // keep hard edges, UV seams and material borders intact (attributes nx ny nz u v mat)
     mesh.attribute_protect_mask = 0x3F;
+    // seams that only the extra data has (a second UV map, a colour boundary): protect those vertices
+    std::vector<unsigned char> locks;
+    if (E) {
+        std::vector<unsigned int> same(vertices.size());
+        meshopt_generatePositionRemap(same.data(), &vertices[0].px, vertices.size(), sizeof(Vertex));
+        locks.assign(vertices.size(), 0);
+        for (size_t i = 0; i < vertices.size(); ++i) {
+            const size_t r = same[i];
+            if (r != i && std::memcmp(&extras[i * E], &extras[r * E], E * sizeof(float)) != 0) {
+                locks[i] |= meshopt_SimplifyVertex_Protect;
+                locks[r] |= meshopt_SimplifyVertex_Protect;
+            }
+        }
+        mesh.vertex_lock = locks.data();
+    }
 
     std::vector<clodGroup> groups;
     std::vector<OutCluster> clusters;
@@ -426,6 +457,17 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     h.off_chunks = place(chunks.size() * sizeof(vgeo2::Chunk));
     h.off_chunk_clusters = place(chunk_clusters.size() * 4);
     h.off_materials = place(names.size());
+    std::string desc;
+    if (E) {
+        h.reserved[vgeo2::kExtraOffset] = place(extras.size() * 4);
+        h.reserved[vgeo2::kExtraCount] = E;
+    }
+    if (in->extra_desc && *in->extra_desc) {   // stored with or without extra data (UV name, texture space)
+        uint32_t len = uint32_t(std::strlen(in->extra_desc));
+        desc.append(reinterpret_cast<const char*>(&len), 4);
+        desc.append(in->extra_desc, len);
+        h.reserved[vgeo2::kExtraDesc] = place(desc.size());
+    }
     h.file_size = off;
 
     // write to a temp file and rename, so a failed build never leaves a truncated asset
@@ -448,6 +490,8 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     put(h.off_chunks, chunks.data(), chunks.size() * sizeof(vgeo2::Chunk));
     put(h.off_chunk_clusters, chunk_clusters.data(), chunk_clusters.size() * 4);
     put(h.off_materials, names.data(), names.size());
+    if (E) put(h.reserved[vgeo2::kExtraOffset], extras.data(), extras.size() * 4);
+    if (!desc.empty()) put(h.reserved[vgeo2::kExtraDesc], desc.data(), desc.size());
     // pad to the declared size
     if (ok && h.file_size > h.off_materials + names.size()) {
         const char zero[16] = {};

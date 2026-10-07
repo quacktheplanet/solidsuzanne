@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define VGEO_STREAM_VERSION 2
+#define VGEO_STREAM_VERSION 3
 
 // ---------------------------------------------------------------- build
 
@@ -45,6 +45,12 @@ typedef struct vgeo_build_input {
     uint32_t max_triangles;       // triangles per cluster, 0 = 128
     uint32_t target_chunks;       // streaming chunks, 0 = auto
     const float* material_params; // material_count * 4 (r, g, b, roughness), or NULL
+    // version 3: more per-corner/per-vertex data carried through to every cut (more UV maps, colour
+    // attributes): extra_count floats per corner (soup) or vertex (indexed), welded and seam-protected
+    // like the UVs. extra_desc is stored as-is for the reader to interpret (UTF-8, may be NULL).
+    uint32_t extra_count;
+    const float* extras;
+    const char* extra_desc;
 } vgeo_build_input;
 
 // stage: 0 = welding, 1 = building DAG (progress 0..1 is approximate), 2 = writing
@@ -81,6 +87,7 @@ typedef struct vgeo_info {
     uint32_t source_triangles;
     float aabb_min[3];
     float aabb_max[3];
+    uint32_t extra_count;         // version 3: floats of extra data per vertex
 } vgeo_info;
 
 // A view, in the asset's local space.
@@ -128,6 +135,9 @@ typedef struct vgeo_chunk_data {
     uint32_t edge_count;
     const int32_t* edge_verts;    // edge_count * 2
     const int32_t* corner_edges;  // tri_count * 3
+    // version 3
+    uint32_t extra_count;
+    const float* extras;          // vertex_count * extra_count (NULL if none)
 } vgeo_chunk_data;
 
 VGEO_API void* vgeo_open(const char* path_utf8, char* err, int err_len);
@@ -181,6 +191,8 @@ VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf8, uint32_t
                                    uint64_t* out_bytes, char* err, int err_len);
 
 VGEO_API int vgeo_version(void);
+// version 3: the extra_desc stored at build time; returns its length (0 if none), copies up to buf_len-1 bytes
+VGEO_API int vgeo_extra_desc(void* handle, char* buf, int buf_len);
 
 #ifdef __cplusplus
 }

@@ -53,8 +53,12 @@ struct Header {
     uint64_t off_materials;   // uint32 count, then per name: uint32 length + UTF-8 bytes,
                               // then optionally "MATP" + count * float4 (base rgb, roughness)
     uint64_t file_size;
+    // reserved[0] = offset of extras: float[vertex_count * extra_count] (0 = none)
+    // reserved[1] = extra_count
+    // reserved[2] = offset of the extra description: uint32 length + UTF-8 bytes (0 = none)
     uint64_t reserved[4];
 };
+enum : uint32_t { kExtraOffset = 0, kExtraCount = 1, kExtraDesc = 2 };
 
 struct Cluster {
     uint32_t index_offset;    // into indices

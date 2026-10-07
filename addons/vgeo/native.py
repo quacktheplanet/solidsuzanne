@@ -30,6 +30,10 @@ class BuildInput(ctypes.Structure):
         ("max_triangles", ctypes.c_uint32),
         ("target_chunks", ctypes.c_uint32),
         ("material_params", ctypes.c_void_p),
+        # library version 3 (older libraries read only the fields above)
+        ("extra_count", ctypes.c_uint32),
+        ("extras", ctypes.c_void_p),
+        ("extra_desc", ctypes.c_char_p),
     ]
 
 
@@ -59,6 +63,7 @@ class Info(ctypes.Structure):
         ("source_triangles", ctypes.c_uint32),
         ("aabb_min", ctypes.c_float * 3),
         ("aabb_max", ctypes.c_float * 3),
+        ("extra_count", ctypes.c_uint32),      # library version 3
     ]
 
 
@@ -97,6 +102,8 @@ class ChunkData(ctypes.Structure):
         ("edge_count", ctypes.c_uint32),
         ("edge_verts", ctypes.POINTER(ctypes.c_int32)),
         ("corner_edges", ctypes.POINTER(ctypes.c_int32)),
+        ("extra_count", ctypes.c_uint32),      # library version 3
+        ("extras", ctypes.POINTER(ctypes.c_float)),
     ]
 
 
@@ -156,8 +163,19 @@ def lib():
         L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
                                             c.c_char_p, c.c_int]
         L.vgeo_export_web_paged.restype = c.c_int
+    if hasattr(L, "vgeo_extra_desc"):  # library version 3
+        L.vgeo_extra_desc.argtypes = [c.c_void_p, c.c_char_p, c.c_int]
+        L.vgeo_extra_desc.restype = c.c_int
     _lib = L
     return L
+
+
+def supports_extras():
+    """Library version 3+: more UV maps and colour/attribute layers travel with the geometry."""
+    try:
+        return hasattr(lib(), "vgeo_extra_desc")
+    except RuntimeError:
+        return False
 
 
 def available():
@@ -173,11 +191,14 @@ def _ptr(a):
 
 
 def build(path, positions, normals=None, uvs=None, materials=None, material_names=(),
-          max_triangles=128, target_chunks=0, progress=None, indices=None, material_params=None):
+          max_triangles=128, target_chunks=0, progress=None, indices=None, material_params=None,
+          extras=None, extra_desc=""):
     """Build a .vgeo.
 
     Without indices, positions/normals/uvs hold one row per triangle corner.
     With indices (tri_count*3 vertex indices) they hold one row per vertex.
+    extras (same rows, any number of float columns) travel with the geometry into every cut; extra_desc
+    (a string) is stored for the reader. Needs library version 3 (ignored by older ones).
     progress(stage, fraction) -> truthy to cancel. Runs without holding the
     GIL (ctypes releases it), so it can be called from a worker thread.
     """
@@ -221,6 +242,12 @@ def build(path, positions, normals=None, uvs=None, materials=None, material_name
     else:
         material_params = None
     inp.material_params = _ptr(material_params)
+    if supports_extras():
+        if extras is not None and np.size(extras):
+            extras = np.ascontiguousarray(extras, dtype=np.float32).reshape(rows, -1)
+            inp.extra_count = extras.shape[1]
+            inp.extras = _ptr(extras)
+        inp.extra_desc = (extra_desc or "").encode("utf-8")
 
     def _cb(_user, stage, frac):
         try:
@@ -256,6 +283,17 @@ class Asset:
                      for f, _t in Info._fields_}
         self.chunk_count = info.chunk_count
         self.has_uvs = bool(info.flags & 2)
+        self.extra_count = getattr(info, "extra_count", 0) if hasattr(L, "vgeo_extra_desc") else 0
+        self.extra_desc = {}
+        if hasattr(L, "vgeo_extra_desc"):
+            n = L.vgeo_extra_desc(h, None, 0)
+            dbuf = ctypes.create_string_buffer(n + 1)
+            L.vgeo_extra_desc(h, dbuf, n + 1)
+            try:
+                import json
+                self.extra_desc = json.loads(dbuf.value.decode("utf-8")) if n else {}
+            except ValueError:
+                self.extra_desc = {}
         buf = ctypes.create_string_buffer(512)
         self.material_names = []
         for i in range(info.material_count):
@@ -325,13 +363,15 @@ class Asset:
         if not parts:
             return None
         out = {k: [] for k in ("positions", "normals", "uvs", "corner_verts", "face_materials", "face_lod",
-                               "edge_verts", "corner_edges")}
+                               "edge_verts", "corner_edges", "extras")}
         v_off = e_off = 0
         for d in parts:
             out["positions"].append(d["positions"])
             out["normals"].append(d["normals"])
             if d["uvs"] is not None:
                 out["uvs"].append(d["uvs"])
+            if d.get("extras") is not None:
+                out["extras"].append(d["extras"])
             out["corner_verts"].append(d["corner_verts"] + v_off)
             out["face_materials"].append(d["face_materials"])
             out["face_lod"].append(d["face_lod"])
@@ -342,6 +382,9 @@ class Asset:
         res = {k: (np.concatenate(v) if v else None) for k, v in out.items()}
         if len(out["uvs"]) != len(parts):
             res["uvs"] = None
+        if len(out["extras"]) != len(parts):
+            res["extras"] = None
+        res["desc"] = self.extra_desc
         res["vertex_count"] = v_off
         res["edge_count"] = e_off
         res["tri_count"] = len(res["face_materials"])
@@ -383,6 +426,9 @@ class Asset:
             "positions": grab(d.positions, nv * 3, np.float32),
             "normals": grab(d.normals, nv * 3, np.float32),
             "uvs": grab(d.uvs, nv * 2, np.float32) if d.uvs else None,
+            "extras": (grab(d.extras, nv * self.extra_count, np.float32).reshape(nv, self.extra_count)
+                       if self.extra_count and d.extras else None),
+            "desc": self.extra_desc,
             "corner_verts": grab(d.corner_verts, nt * 3, np.int32),
             "face_materials": grab(d.face_materials, nt, np.int32),
             "face_lod": grab(d.face_lod, nt, np.int32),

@@ -517,6 +517,43 @@ def _set_attr(me, name, kind, domain, prop, arr):
     return a
 
 
+_EXTRA_PROPS = {"FLOAT2": "vector", "FLOAT_COLOR": "color", "FLOAT": "value", "FLOAT_VECTOR": "vector"}
+
+
+def _write_extras(me, data, desc, uv_name):
+    """The other UV maps and colour/float attributes of the source, the active ones marked as they were, and
+    the source's texture space (each chunk is its own mesh: left automatic, Generated coordinates would
+    be fitted to every chunk separately)."""
+    ex = data.get("extras")
+    if ex is not None:
+        cv = data["corner_verts"]
+        for ch in desc.get("channels", ()):
+            kind = ch.get("type", "FLOAT")
+            if kind not in _EXTRA_PROPS:
+                continue
+            o, n = int(ch["offset"]), int(ch["size"])
+            vals = np.ascontiguousarray(ex[:, o:o + n][cv], dtype=np.float32).ravel()
+            try:
+                _set_attr(me, ch["name"], kind, 'CORNER', _EXTRA_PROPS[kind], vals)
+            except (RuntimeError, TypeError, ValueError):
+                pass                                  # a clashing name: skip, never break the stream
+    if uv_name in me.uv_layers:
+        me.uv_layers.active = me.uv_layers[uv_name]
+    ru = desc.get("render_uv")
+    if ru and ru in me.uv_layers:
+        me.uv_layers[ru].active_render = True
+    cols = me.color_attributes
+    if desc.get("active_color") and desc["active_color"] in cols:
+        cols.active_color = cols[desc["active_color"]]
+    if desc.get("render_color") and desc["render_color"] in cols and hasattr(cols, "render_color_index"):
+        cols.render_color_index = list(cols).index(cols[desc["render_color"]])
+    ts = desc.get("texspace")
+    if ts and hasattr(me, "texspace_location"):
+        me.use_auto_texspace = False
+        me.texspace_location = ts[0]
+        me.texspace_size = ts[1]
+
+
 def fill_mesh(me, data, materials, lod_colors):
     """Replace a mesh's geometry with an extracted chunk."""
     global _fast_write
@@ -539,9 +576,12 @@ def fill_mesh(me, data, materials, lod_colors):
         _write_slow(me, data)
 
     _set_attr(me, "custom_normal", 'FLOAT_VECTOR', 'POINT', "vector", data["normals"])
+    desc = data.get("desc") or {}
+    uv_name = desc.get("uv_name") or "UVMap"
     if data["uvs"] is not None:
         corner_uv = np.ascontiguousarray(data["uvs"].reshape(-1, 2)[data["corner_verts"]]).ravel()
-        _set_attr(me, "UVMap", 'FLOAT2', 'CORNER', "vector", corner_uv)
+        _set_attr(me, uv_name, 'FLOAT2', 'CORNER', "vector", corner_uv)
+    _write_extras(me, data, desc, uv_name)
     if len(materials) > 1:
         _set_attr(me, "material_index", 'INT', 'FACE', "value", data["face_materials"])
     if lod_colors:
