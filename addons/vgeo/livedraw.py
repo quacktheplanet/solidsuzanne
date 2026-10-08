@@ -13,7 +13,10 @@ keeps Blender's renderers for final renders (and Rendered viewports) and draws t
   matrices in a float texture; the nearest heavy copies get a view-dependent cut of their own;
 - shading reads each material's Principled BSDF (base colour, roughness, normal map via a cotangent frame,
   image or value), lit by the scene's lights and the world colour, tone-mapped like the scene's view
-  transform (AgX approximated), depth-tested against the viewport so it mixes with other objects.
+  transform (AgX approximated), depth-tested against the viewport so it mixes with other objects;
+- the scene's sun casts shadows (shadows.py): virtualized assets and copies shadow themselves, each other
+  and ordinary meshes (which Blender drew: the same triangles are drawn again over them, darkening by
+  shadowed / unshadowed), and ordinary meshes shadow virtualized ones.
 
 Final renders and Rendered viewports keep the Blender-object path untouched; Live Draw switches itself
 off while any 3D view is in Rendered shading.
@@ -41,7 +44,7 @@ _assets = {}             # .vgeo path -> GpuAsset
 _cuts = {}               # key -> Cut (proxies: uid; near copies: (inst uid, slot k))
 _levels = {}             # instancer uid -> LevelSet
 _state = {"active": False, "handler": None, "drawn": 0, "frame_ms": [], "stats": {}, "by": {}, "landed": 0}
-_shader = None
+_shader = {}
 _textures = {}           # image name -> GPUTexture
 _dummy = {}
 
@@ -82,7 +85,8 @@ struct LiveMaterial {
 };
 struct LiveShadow {
   mat4 mat[3];      /* per cascade: world -> shadow map (xy texture coordinates, z depth, 0 at the light) */
-  vec4 info;        /* x: index of the light that casts shadows (-1: none), y: cascades, z: map size (texels) */
+  vec4 info;        /* x: index of the light that casts shadows (-1: none), y: cascades, z: map size (texels),
+                       w: 1 when layers 3.. hold the ordinary meshes' cascades */
   vec4 bias[3];     /* per cascade: x texel size in world units, y depth units per world unit */
 };
 """
@@ -97,6 +101,10 @@ void main() {
   wnrm = mat3(M) * nrm;
   vuv = uv;
   gl_Position = viewproj * wp;
+#ifdef RECEIVER
+  /* the same surface Blender drew: win the depth test against it, by a few depth steps */
+  gl_Position.z -= 4e-7 * gl_Position.w;
+#endif
 }
 """
 
@@ -129,6 +137,11 @@ float smith(float nv, float nl, float a) {
    point. Normal offset and slope-scaled depth bias in shadow texels, so neither acne nor peter-panning. */
 float sun_shadow(vec3 P0, vec3 Ng, vec3 L) {
   int n = int(S.info.y);
+#ifdef RECEIVER
+  bool ordinary = false;   /* Blender already shadows its own meshes with each other */
+#else
+  bool ordinary = S.info.w > 0.5;
+#endif
   float res = S.info.z;
   float nl = clamp(dot(Ng, L), 0.0, 1.0);
   float sinl = sqrt(max(1.0 - nl * nl, 0.0));
@@ -150,6 +163,7 @@ float sun_shadow(vec3 P0, vec3 Ng, vec3 L) {
       for (int i = 0; i < 4; i++) {
         float wx = (i == 0) ? 1.0 - f.x : ((i == 3) ? f.x : 1.0);
         float d = texelFetch(shadow_tex, ivec3(i0 + ivec2(i, j), c), 0).r;
+        if (ordinary) d = min(d, texelFetch(shadow_tex, ivec3(i0 + ivec2(i, j), c + 3), 0).r);
         lit += wx * wy * step(ref, d);
       }
     }
@@ -188,6 +202,8 @@ void main() {
   vec3 diff = albedo * (1.0 - metal);
   float a = rough * rough;
   vec3 col = diff * P.ambient.rgb + F0 * P.ambient.rgb * 0.5;
+  vec3 sun = vec3(0.0);   /* the shadowing sun's unshadowed term */
+  float sh = 1.0;
   for (int i = 0; i < 4; i++) {
     float kind = P.light_vec[i].w;
     if (kind < 0.5) continue;
@@ -200,21 +216,41 @@ void main() {
     float nh = max(dot(N, H), 0.0);
     vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
     vec3 spec = F * ggx(nh, a) * smith(nv, nl, a) / max(4.0 * nv * nl, 1e-4);
-    if (i == shadow_light) E *= sun_shadow(wpos, Ng, L);
-    col += (diff / 3.14159265 + spec) * E * nl;
+    vec3 c = (diff / 3.14159265 + spec) * E * nl;
+    if (i == shadow_light) {
+      sh = sun_shadow(wpos, Ng, L);
+      sun = c;
+      c *= sh;
+    }
+    col += c;
   }
   col *= P.params.w;
+#ifdef RECEIVER
+  /* Blender shaded this surface itself: darken it by how much the shadow takes away, the ratio of the
+     tone-mapped luminances with and without it. Draw handlers paint into the overlay buffer that is
+     composited over Blender's image, so the darkening is black at that much coverage. */
+  if (sh >= 1.0) discard;
+  vec3 lit = col + sun * (1.0 - sh) * P.params.w;
+  if (P.flags.w > 0.5) { col = agx_display_linear(col); lit = agx_display_linear(lit); }
+  const vec3 lw = vec3(0.2126, 0.7152, 0.0722);
+  float ratio = clamp(dot(col, lw) / max(dot(lit, lw), 1e-6), 0.0, 1.0);
+  frag = vec4(0.0, 0.0, 0.0, 1.0 - ratio);
+#else
   if (P.flags.w > 0.5) col = agx_display_linear(col);
   frag = vec4(col, 1.0);
+#endif
 }
 """
 
 
-def shader():
-    global _shader
-    if _shader is not None:
-        return _shader
+def shader(receiver=False):
+    """The Live Draw shader; receiver=True: the variant that darkens surfaces Blender drew (see Receivers)."""
+    sh = _shader.get(receiver)
+    if sh is not None:
+        return sh
     ci = gpu.types.GPUShaderCreateInfo()
+    if receiver:
+        ci.define("RECEIVER", "1")
     ci.typedef_source(_TYPEDEF)
     ci.vertex_in(0, 'VEC3', "pos")
     ci.vertex_in(1, 'VEC3', "nrm")
@@ -237,8 +273,8 @@ def shader():
     ci.fragment_out(0, 'VEC4', "frag")
     ci.vertex_source(_VERT)
     ci.fragment_source(_FRAG)
-    _shader = gpu.shader.create_from_info(ci)
-    return _shader
+    sh = _shader[receiver] = gpu.shader.create_from_info(ci)
+    return sh
 
 
 def _dummy_tex(kind):
@@ -752,6 +788,8 @@ def tick(views, budget=TICK_BUDGET):
     """Choose cuts and levels for these views and build index buffers within the budget. Called from the
     live loop. Returns True while work remains."""
     from . import instances, stream
+    if refresh_receivers():
+        _tag_redraw()
     vkey = (tuple(round(x, 5) for v in views for m in (v[0], v[1]) for row in m for x in row),
             _scene_key(bpy.context.scene))
     if vkey == _frame.get("vkey") and not _frame.get("busy", True):
@@ -961,6 +999,205 @@ def _local_views(m, views, pixel_error):
 _local_views_for = _local_views
 
 
+# ---------------------------------------------------------------- receivers
+
+RECEIVER_MAX_TRIS = 2_000_000   # ordinary meshes beyond this (all together) get no Live Draw shadows
+RECEIVER_RESCAN = 0.5           # seconds between looks at which ordinary meshes are visible (after a change)
+_recv = {"dirty": True, "t": 0.0, "list": [], "geo": {}, "stale": set(), "ubos": {}, "skipped": 0}
+
+
+class Receiver:
+    """An ordinary visible mesh (not virtualized) that receives Live Draw shadows: its evaluated triangles,
+    uploaded once (again when its geometry changes), one batch per material."""
+
+    def __init__(self, ob, depsgraph):
+        ev = ob.evaluated_get(depsgraph)
+        self.materials = [s.material for s in ev.material_slots]
+        self.batches = []
+        self.triangles = 0
+        self.corners = None
+        me = ev.to_mesh()
+        try:
+            me.calc_loop_triangles()
+            T = len(me.loop_triangles)
+            if T == 0:
+                return
+            loops = np.empty(T * 3, np.int32)
+            me.loop_triangles.foreach_get("loops", loops)
+            verts = np.empty(T * 3, np.int32)
+            me.loop_triangles.foreach_get("vertices", verts)
+            mat = np.empty(T, np.int32)
+            me.loop_triangles.foreach_get("material_index", mat)
+            co = np.empty(len(me.vertices) * 3, np.float32)
+            me.vertices.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            cn = np.empty(len(me.loops) * 3, np.float32)
+            me.corner_normals.foreach_get("vector", cn)
+            uvl = me.uv_layers.active
+            uv = None
+            if uvl is not None:
+                uv = np.empty(len(me.loops) * 2, np.float32)
+                uvl.data.foreach_get("uv", uv)
+                uv = uv.reshape(-1, 2)
+            lo, hi = co.min(0), co.max(0)
+            self.corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                                     for z in (lo[2], hi[2])], np.float64)
+            pos = co[verts].reshape(T, 3, 3)
+            nrm = cn.reshape(-1, 3)[loops].reshape(T, 3, 3)
+            tuv = uv[loops].reshape(T, 3, 2) if uv is not None else np.zeros((T, 3, 2), np.float32)
+            fmt = gpu.types.GPUVertFormat()
+            fmt.attr_add(id="pos", comp_type='F32', len=3, fetch_mode='FLOAT')
+            fmt.attr_add(id="nrm", comp_type='F32', len=3, fetch_mode='FLOAT')
+            fmt.attr_add(id="uv", comp_type='F32', len=2, fetch_mode='FLOAT')
+            for m in np.unique(mat):
+                sel = mat == m
+                n = int(sel.sum()) * 3
+                vbo = gpu.types.GPUVertBuf(fmt, n)
+                vbo.attr_fill("pos", pos[sel].reshape(-1, 3))
+                vbo.attr_fill("nrm", nrm[sel].reshape(-1, 3))
+                vbo.attr_fill("uv", tuv[sel].reshape(-1, 2))
+                self.batches.append((int(m), gpu.types.GPUBatch(type='TRIS', buf=vbo), n // 3))
+            self.triangles = T
+        finally:
+            ev.to_mesh_clear()
+
+
+def _receiver_candidates(scene, vl):
+    out = []
+    for ob in scene.objects:
+        if ob.type != 'MESH' or ob.name.startswith("vgeo.") or ob.vgeo.uid or ob.vgeo_inst.uid:
+            continue      # virtualized: proxies, their chunk objects, streamed copies, instancers
+        try:
+            if not ob.visible_get(view_layer=vl):
+                continue
+        except RuntimeError:
+            continue
+        out.append(ob)
+    return out
+
+
+def refresh_receivers(force=False):
+    """Bring the receiver list up to date after scene changes (at most every RECEIVER_RESCAN seconds).
+    Returns True when it changed."""
+    now = time.perf_counter()
+    if not force and (not _recv["dirty"] or now - _recv["t"] < RECEIVER_RESCAN):
+        return False
+    _recv["dirty"] = False
+    _recv["t"] = now
+    scene, vl = bpy.context.scene, bpy.context.view_layer
+    dg = bpy.context.evaluated_depsgraph_get()
+    geo = _recv["geo"]
+    out, total, skipped = [], 0, 0
+    for ob in _receiver_candidates(scene, vl):
+        r = geo.get(ob.name)
+        if r is None or ob.name in _recv["stale"]:
+            r = geo[ob.name] = Receiver(ob, dg)
+        if not r.batches:
+            continue
+        if total + r.triangles > RECEIVER_MAX_TRIS:
+            skipped += 1
+            continue
+        total += r.triangles
+        out.append((ob, r))
+    _recv["stale"].clear()
+    for name in [n for n in geo if n not in {ob.name for ob, _r in out}]:
+        geo.pop(name)
+    changed = [(ob.name, id(r)) for ob, r in out] != [(ob.name, id(r)) for ob, r in _recv["list"]]
+    _recv["list"] = out
+    _recv["skipped"] = skipped
+    sig = []
+    for ob, r in out:
+        sig.append((ob.name, id(r), tuple(round(x, 5) for row in ob.matrix_world for x in row)))
+    sig = hash(tuple(sig))
+    if sig != _frame.get("receiver_sig"):
+        changed = True
+    _frame["receiver_sig"] = sig
+    _frame["receivers"] = out
+    b = receiver_bounds()
+    old = _frame.get("receiver_bounds")
+    if (b is None) != (old is None) or (b is not None and not (np.allclose(b[0], old[0]) and np.allclose(b[1], old[1]))):
+        changed = True
+    _frame["receiver_bounds"] = b
+    return changed
+
+
+def receiver_bounds():
+    """World bounds (lo, hi) of the receivers, or None."""
+    lows, highs = [], []
+    for ob, r in _recv["list"]:
+        try:
+            c = (np.c_[r.corners, np.ones(8)] @ np.array(ob.matrix_world, np.float64).T)[:, :3]
+        except ReferenceError:
+            continue
+        lows.append(c.min(0))
+        highs.append(c.max(0))
+    return (np.min(lows, 0), np.max(highs, 0)) if lows else None
+
+
+def _receiver_material(mat, scene, lsig):
+    key = (mat.name if mat else None, lsig)
+    cur = _recv["ubos"].get(key)
+    if cur is None:
+        info = material_info(mat)
+        cur = _recv["ubos"][key] = (_material_ubo(info, scene), info)
+        if len(_recv["ubos"]) > 256:
+            _recv["ubos"].clear()
+            _recv["ubos"][key] = cur
+    return cur
+
+
+def _depth_prepass(rv3d):
+    sh = shadows.depth_shader()
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_mask_set(True)
+    gpu.state.color_mask_set(False, False, False, False)
+    sh.bind()
+    sh.uniform_float("viewproj", rv3d.perspective_matrix)
+    sh.uniform_int("inst_base", 0)
+    sh.uniform_float("depth_push", 0.0)
+    for ob, r in _recv["list"]:
+        try:
+            mw = ob.matrix_world
+        except ReferenceError:
+            continue
+        sh.uniform_sampler("inst_tex", _one_matrix(("recv", ob.name), mw))
+        for _m, batch, _tris in r.batches:
+            batch.draw(sh)
+    gpu.state.color_mask_set(True, True, True, True)
+
+
+def _draw_receivers(rv3d, cam, s_ubo, s_tex, scene, lsig):
+    """Darken the ordinary meshes Blender drew where Live Draw's sun shadow falls on them: the same
+    triangles again, depth-tested against Blender's own, as black at 1 - shadowed / unshadowed coverage."""
+    sh = shader(receiver=True)
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_mask_set(False)
+    gpu.state.blend_set('ALPHA')
+    sh.bind()
+    sh.uniform_float("viewproj", rv3d.perspective_matrix)
+    sh.uniform_float("cam_pos", (cam.x, cam.y, cam.z, 1.0))
+    sh.uniform_block("S", s_ubo)
+    sh.uniform_sampler("shadow_tex", s_tex)
+    sh.uniform_int("inst_base", 0)
+    drawn = 0
+    for ob, r in _recv["list"]:
+        try:
+            mw = ob.matrix_world
+        except ReferenceError:
+            continue
+        sh.uniform_sampler("inst_tex", _one_matrix(("recv", ob.name), mw))
+        for m, batch, tris in r.batches:
+            ubo, info = _receiver_material(r.materials[m] if m < len(r.materials) else None, scene, lsig)
+            sh.uniform_block("P", ubo)
+            sh.uniform_sampler("base_tex", _image_tex(info["base_tex"]) or _dummy_tex("white"))
+            sh.uniform_sampler("rough_tex", _image_tex(info["rough_tex"]) or _dummy_tex("white"))
+            sh.uniform_sampler("normal_tex", _image_tex(info["normal_tex"]) or _dummy_tex("normal"))
+            batch.draw(sh)
+            drawn += tris
+    gpu.state.blend_set('NONE')
+    return drawn
+
+
 # ---------------------------------------------------------------- drawing
 
 def _usable_depth(region):
@@ -970,8 +1207,10 @@ def _usable_depth(region):
         fb = gpu.state.active_framebuffer_get()
         if fb.read_depth(1, max(0, region.height - 2), 1, 1).to_list()[0][0] == 0.0:
             fb.clear(depth=1.0)
+            return False
     except Exception:
         pass
+    return True
 
 
 def _draw():
@@ -999,14 +1238,22 @@ def _draw():
     _state["shadowed"] = shadow is not None
     t_shadow = time.perf_counter()
     s_ubo, s_tex = shadow or shadows.none_bindings()
+    depth_ok = True
     if space.shading.type == 'MATERIAL':
-        _usable_depth(ctx.region)
+        depth_ok = _usable_depth(ctx.region)
+    cam = rv3d.view_matrix.inverted().translation
+    _state["received"] = 0
+    if not depth_ok and _recv["list"]:
+        # no depth from Blender (Material Preview, overlays hidden): its meshes' own, so they hide what
+        # is behind them and receive shadows
+        _depth_prepass(rv3d)
+    if shadow is not None and _recv["list"]:
+        _state["received"] = _draw_receivers(rv3d, cam, s_ubo, s_tex, scene, lsig)
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(True)
     gpu.state.blend_set('NONE')
     sh.bind()
     sh.uniform_float("viewproj", rv3d.perspective_matrix)
-    cam = rv3d.view_matrix.inverted().translation
     sh.uniform_float("cam_pos", (cam.x, cam.y, cam.z, 1.0))
     sh.uniform_block("S", s_ubo)
     sh.uniform_sampler("shadow_tex", s_tex)
@@ -1089,6 +1336,9 @@ def free_all():
     _one.clear()
     _textures.clear()
     shadows.free_all()
+    _recv["list"], _recv["geo"], _recv["dirty"] = [], {}, True
+    _frame["receivers"], _frame["receiver_bounds"], _frame["receiver_sig"] = [], None, None
+    _recv["ubos"].clear()
     _frame["drawables"] = []
     _frame["casters"] = []
     _frame["bounds"] = None
@@ -1101,7 +1351,12 @@ def _on_depsgraph(_scene, depsgraph):
         i = u.id
         if isinstance(i, (bpy.types.Light, bpy.types.World)) or (isinstance(i, bpy.types.Object) and i.type == 'LIGHT'):
             _frame["light_sig_t"] = 0.0
-            return
+        elif isinstance(i, bpy.types.Object) and i.type == 'MESH' and not i.vgeo.uid:
+            _recv["dirty"] = True
+            if u.is_updated_geometry:
+                _recv["stale"].add(i.name)
+        elif isinstance(i, (bpy.types.Collection, bpy.types.Scene)):
+            _recv["dirty"] = True
 
 
 def register():

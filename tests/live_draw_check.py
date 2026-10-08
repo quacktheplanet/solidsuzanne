@@ -5,7 +5,9 @@ is fast, renders stay EEVEE.
 
 Without a scene it builds one: a 260k-triangle sphere with an image base colour and an image
 normal map (both generated) floating over a virtualized ground, 60 instanced copies of a virtualized rock
-scattered on the ground, a sun and a plain world. With a scene (e.g. a virtualized Poly Haven scan) it uses
+scattered on the ground, two ordinary (not virtualized) meshes: a slab half in the sphere's shadow and a
+pillar casting onto the ground, a sun and a plain world. Overlays are hidden (Material Preview then gives
+draw handlers no depth; Live Draw writes the ordinary meshes' own). With a scene (e.g. a virtualized Poly Haven scan) it uses
 its VGEO proxies, its suns and the scene camera.
 
 1. Live Draw draws the assets in Material Preview (scene lights and world), triangles counted
@@ -16,13 +18,16 @@ its VGEO proxies, its suns and the scene camera.
    (a flat grey asset differs by 40-70/255)
 3. with the sun's shadows on, Live Draw against EEVEE again:
    - shadows appear: on the generated scene, the ground under the sphere's shadow (worked out from the sun
-     direction) is much darker than without shadows;
+     direction) is much darker than without shadows; the ordinary slab in it darkens like in EEVEE, and
+     the ordinary pillar's shadow on the virtualized ground is as dark as EEVEE's;
    - they land where EEVEE's do: the pixels that darken when shadows go on, Live Draw against EEVEE,
      overlap (intersection over union);
    - it still looks like EEVEE overall;
+   - the same with overlays shown (Blender's depth instead of Live Draw's own);
    - the Shadows scene toggle and the light's own Shadow toggle each switch them off
 4. drawing stays fast: the draw handler's own time (shadow map updates included) under 4 ms while
-   orbiting, frames while orbiting under 33 ms median, with and without shadows (both reported)
+   orbiting, frames while orbiting under 33 ms median, with and without shadows (both reported), and a
+   still view renders no shadow map
 5. a final render (F12 path) still goes through EEVEE with real meshes: the assets are in the render, and
    on the generated scene the sphere's shadow is in it too
 """
@@ -177,6 +182,30 @@ def build_scene():
     cam.location = (-7.0, -8.5, 4.0)
     cam.rotation_euler = (Vector((-0.9, 0.6, -1.6)) - cam.location).to_track_quat('-Z', 'Y').to_euler()
     bpy.context.scene.camera = cam
+    # an ordinary mesh (not virtualized), half in the sphere's shadow: Live Draw darkens it too
+    bpy.context.view_layer.update()
+    sme = bpy.data.meshes.new("live_slab")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    bm.to_mesh(sme)
+    bm.free()
+    slab = bpy.data.objects.new("live_slab", sme)
+    slab.location = slab_center()
+    slab.scale = (SLAB, SLAB, 0.3)
+    slab.data.materials.append(plain_material("live_slab_mat", (0.45, 0.55, 0.6), 0.6))
+    bpy.context.scene.collection.objects.link(slab)
+    # and an ordinary pillar in the open, casting onto the virtualized ground
+    pme = bpy.data.meshes.new("live_pillar")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    bm.to_mesh(pme)
+    bm.free()
+    pillar = bpy.data.objects.new("live_pillar", pme)
+    base, _tip = pillar_points()
+    pillar.location = base + Vector((0, 0, 1.4))
+    pillar.scale = (0.4, 0.4, 3.0)
+    pillar.data.materials.append(plain_material("live_pillar_mat", (0.6, 0.5, 0.4), 0.6))
+    bpy.context.scene.collection.objects.link(pillar)
     bpy.ops.wm.save_as_mainfile(filepath=os.path.join(OUT, "live_scene.blend"))
     virtualize(ob)
     rp = virtualize(rock)
@@ -266,6 +295,42 @@ def lit_points():
     return [SPHERE_CENTER + h * 3.0 + side * s_ + Vector((0, 0, GROUND_Z + 0.05)) for s_ in (-1.5, 0.0, 1.5)]
 
 
+SLAB = 1.8
+
+
+def slab_center():
+    """Beside the shadow's middle, so the slab's inner half is shadowed."""
+    sun = next(o for o in bpy.context.scene.objects if o.type == 'LIGHT' and o.data.type == 'SUN')
+    d = (sun.matrix_world.to_3x3() @ Vector((0, 0, 1))).normalized()
+    h = Vector((d.x, d.y, 0)).normalized()
+    side = Vector((-h.y, h.x, 0))
+    p = shadow_point() + side * 1.9
+    return Vector((p.x, p.y, GROUND_Z + 0.15))
+
+
+def slab_shadow_point():
+    """On the slab's top, inside the sphere's shadow."""
+    c = slab_center()
+    toward = (shadow_point() - c)
+    toward.z = 0
+    p = c + toward.normalized() * (SLAB * 0.35)
+    return Vector((p.x, p.y, GROUND_Z + 0.31))
+
+
+def pillar_points():
+    """(base of the pillar, a ground point in its shadow), in the open on the sun's side of the sphere."""
+    sun = next(o for o in bpy.context.scene.objects if o.type == 'LIGHT' and o.data.type == 'SUN')
+    d = (sun.matrix_world.to_3x3() @ Vector((0, 0, 1))).normalized()
+    h = Vector((d.x, d.y, 0)).normalized()
+    side = Vector((-h.y, h.x, 0))
+    base = SPHERE_CENTER + h * 3.0 - side * 3.0
+    base.z = GROUND_Z
+    reach = 1.5 * Vector((d.x, d.y, 0)).length / d.z      # where the pillar's middle falls
+    tip = base - h * reach
+    tip.z = GROUND_Z + 0.08
+    return base, tip
+
+
 def suns(scene):
     return [o for o in scene.objects if o.type == 'LIGHT' and o.data.type == 'SUN']
 
@@ -344,7 +409,17 @@ def tick():
         space.shading.type = 'MATERIAL'
         space.shading.use_scene_lights = True
         space.shading.use_scene_world = True
+        # overlays hidden: Material Preview then gives draw handlers no depth, and Live Draw writes the
+        # ordinary meshes' own (step 8 checks the overlays-on path, with Blender's depth, gives the same)
         space.overlay.show_overlays = False
+        for prop in ("show_floor", "show_axis_x", "show_axis_y", "show_axis_z", "show_cursor", "show_text",
+                     "show_stats", "show_extras", "show_object_origins", "show_outline_selected",
+                     "show_relationship_lines", "show_bones", "show_motion_paths", "show_annotation",
+                     "show_look_dev"):
+            if hasattr(space.overlay, prop):
+                setattr(space.overlay, prop, False)
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
         r3.view_perspective = 'CAMERA'
         st["suns"] = suns(scene)
         st["shadow_was"] = [s.data.use_shadow for s in st["suns"]]
@@ -421,9 +496,36 @@ def tick():
             check("the ground under the sphere's shadow is darker", on < 0.8 * off and on < 0.8 * lit,
                   f"luminance {off:.0f} -> {on:.0f} with shadows (EEVEE {ev:.0f}; lit ground beside it "
                   f"{lit:.0f}) at pixel {rc}")
-        scene.vgeo_live_shadows = False        # the scene toggle switches them off
+            rc = to_px(slab_shadow_point())
+            off, on, ev = patch(live, rc, 4), patch(live_sh, rc, 4), patch(eevee_sh, rc, 4)
+            ev_off = patch(eevee, rc, 4)
+            report.update(slab_spot_lum=dict(live_off=off, live_on=on, eevee_off=ev_off, eevee_on=ev),
+                          receiver_triangles=livedraw._state.get("received", 0))
+            rc2 = to_px(pillar_points()[1])
+            p_off, p_on, p_ev, p_ev_off = (patch(im, rc2, 3) for im in (live, live_sh, eevee_sh, eevee))
+            report.update(pillar_spot_lum=dict(live_off=p_off, live_on=p_on, eevee_off=p_ev_off, eevee_on=p_ev))
+            check("an ordinary mesh casts onto virtualized ones, as dark as in EEVEE",
+                  p_on < 0.8 * p_off and abs(p_on - p_ev) < 0.15 * p_ev_off,
+                  f"luminance {p_off:.0f} -> {p_on:.0f} with shadows (EEVEE {p_ev_off:.0f} -> {p_ev:.0f}) "
+                  f"at pixel {rc2}")
+            check("an ordinary mesh receives the shadow too, as dark as in EEVEE",
+                  on < 0.8 * off and abs(on - ev) < 0.15 * ev_off,
+                  f"luminance {off:.0f} -> {on:.0f} with shadows (EEVEE {ev_off:.0f} -> {ev:.0f}) at pixel {rc}")
+        space.overlay.show_overlays = True     # Blender's own depth this time
         return 1.0
     if k == 8:
+        img = shot("live_draw_shadows_overlays")
+        space.overlay.show_overlays = False
+        if generated["on"]:
+            pts = [shadow_point(), slab_shadow_point(), pillar_points()[1]]
+            a = [patch(st["live_sh"], to_px(p), 3) for p in pts]
+            b = [patch(img, to_px(p), 3) for p in pts]
+            worst = max(abs(x - y) for x, y in zip(a, b))
+            check("the same shadows with overlays shown (Blender's depth) as hidden (Live Draw's own)",
+                  worst < 6.0, "luminance " + ", ".join(f"{x:.0f}/{y:.0f}" for x, y in zip(a, b)))
+        scene.vgeo_live_shadows = False        # the scene toggle switches them off
+        return 1.0
+    if k == 9:
         img = shot("live_draw_shadows_toggled_off")
         d = float(np.abs(img - st["live"]).max(2)[asset_mask(img)].mean())
         check("the Shadows toggle switches them off", d < 1.5 and not livedraw._state.get("shadowed"),
@@ -432,7 +534,7 @@ def tick():
         for s in st["suns"]:                    # ... and so does the light's own Shadow toggle
             s.data.use_shadow = False
         return 1.0
-    if k == 9:
+    if k == 10:
         img = shot("live_draw_light_shadow_off")
         d = float(np.abs(img - st["live"]).max(2)[asset_mask(img)].mean())
         check("the light's Shadow option switches them off", d < 1.5 and not livedraw._state.get("shadowed"),
@@ -449,6 +551,8 @@ def tick():
         st["orbit0"] = k + 1
         return 0.5
     o = k - st["orbit0"]
+    if o == 3:     # how Solid shading looks with shadows (no check: workbench lighting is not the sun's)
+        shot("live_draw_solid_shadows")
     if o < ORBIT:  # orbit, shadows on
         r3.view_rotation.rotate(Euler((0, 0, 0.01)))
         area.tag_redraw()

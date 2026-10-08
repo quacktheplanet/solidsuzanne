@@ -12,6 +12,10 @@
   mismatch); an instancer draws every placement in the cascade's box with one shared level, the coarsest
   whose error stays under a shadow texel (the near copies' own cuts are not used: copies are cheaper at a
   level, and the shadow map can't resolve more).
+- Ordinary meshes (not virtualized; livedraw's receivers) cast into a second set of layers, re-rendered
+  only when they move or change. Virtualized surfaces test both sets; ordinary meshes test only the
+  virtualized one (Blender already shadows its own meshes with each other), and are darkened by a second
+  pass over Blender's image (livedraw._draw_receivers).
 - Sampling (livedraw's fragment shader): 4x4 texel fetches weighted into a 3-texel tent (PCF), a depth
   bias of one texel plus a slope-scaled part, and a normal offset that grows with the angle to the light.
 """
@@ -95,12 +99,15 @@ def none_bindings():
 
 
 class ShadowMap:
+    """Layers 0..2: the cascades of virtualized casters; 3..5: the same cascades of ordinary meshes."""
+
     def __init__(self):
-        self.tex = gpu.types.GPUTexture((RES, RES), layers=MAX_CASCADES, format='DEPTH_COMPONENT32F')
+        self.tex = gpu.types.GPUTexture((RES, RES), layers=2 * MAX_CASCADES, format='DEPTH_COMPONENT32F')
         self.fbs = [gpu.types.GPUFrameBuffer(depth_slot={"texture": self.tex, "layer": c})
-                    for c in range(MAX_CASCADES)]
+                    for c in range(2 * MAX_CASCADES)]
         self.boxes = [None] * MAX_CASCADES      # (cx, cy, size)
         self.keys = [None] * MAX_CASCADES
+        self.keys_b = [None] * MAX_CASCADES     # the ordinary meshes' layer of each cascade
         self.mats = [None] * MAX_CASCADES       # world -> (u, v, depth)
         self.bias = [(0.0, 0.0, 0.0, 0.0)] * MAX_CASCADES
         self.keep = [None] * MAX_CASCADES       # matrix textures in use by a cascade's last render
@@ -112,6 +119,10 @@ class ShadowMap:
 
 def free_all():
     _maps.clear()
+
+
+def _box8(a, b):
+    return np.array([[x, y, z] for x in (a[0], b[0]) for y in (a[1], b[1]) for z in (a[2], b[2])], np.float64)
 
 
 def _basis(d):
@@ -242,6 +253,29 @@ def _cascade_items(casters, r, u, box, texel, zr, ls_wanted):
     return items, keep
 
 
+def _ordinary_items(receivers, r, u, box):
+    """The ordinary meshes (Live Draw's receivers) that touch a cascade's box, as casters."""
+    from . import livedraw
+    cx, cy, s = box
+    h = s * 0.5
+    rv = np.array(tuple(r), np.float64)
+    uv = np.array(tuple(u), np.float64)
+    items = []
+    for ob, rc in receivers:
+        try:
+            mw = ob.matrix_world
+        except ReferenceError:
+            continue
+        pts = (np.c_[rc.corners, np.ones(8)] @ np.array(mw, np.float64).T)[:, :3]
+        px, py = pts @ rv, pts @ uv
+        if px.max() < cx - h or px.min() > cx + h or py.max() < cy - h or py.min() > cy + h:
+            continue
+        tex = livedraw._one_matrix(("recv", ob.name), mw)
+        for _m, batch, tris in rc.batches:
+            items.append((tex, 0, 1, batch, tris, 0.0))
+    return items
+
+
 def _render(sm, c, mat, items):
     sh = depth_shader()
     fb = sm.fbs[c]
@@ -297,9 +331,13 @@ def update(rv3d, space, light, frame):
     sm.used = t_start
     r, u, d = _basis(ldir)
     lo, hi = bounds
-    bc = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    rb = frame.get("receiver_bounds")
+    if rb is not None:            # ordinary meshes receive too: they extend the depths, not the casters' area
+        lo, hi = np.minimum(lo, rb[0]), np.maximum(hi, rb[1])
+    cc = _box8(*bounds)
+    bc = _box8(lo, hi)
     rv, uv, dv = (np.array(tuple(a), np.float64) for a in (r, u, d))
-    sx, sy, sz = bc @ rv, bc @ uv, bc @ dv
+    sx, sy, sz = cc @ rv, cc @ uv, bc @ dv
     z0, z1 = _zrange(float(sz.min()), float(sz.max()))
     # the view depths that hold geometry
     view, window = rv3d.view_matrix, rv3d.window_matrix
@@ -322,6 +360,8 @@ def update(rv3d, space, light, frame):
     splits = _splits(d0, d1, n)
     ldkey = tuple(round(x, 4) for x in d)
     sig = frame.get("shadow_sig")
+    receivers = frame.get("receivers") or []
+    rsig = frame.get("receiver_sig") if receivers else None
     wanted = []
     del stats["levels"][:-24]
     for c in range(n):
@@ -336,24 +376,30 @@ def update(rv3d, space, light, frame):
         box = _box(sm.boxes[c] if sm.keys[c] is not None and sm.keys[c][1] == ldkey else None, x0, x1, y0, y1)
         sm.boxes[c] = box
         key = (box, ldkey, z0, z1, sig)
-        if key == sm.keys[c]:
+        key_b = (box, ldkey, z0, z1, rsig) if receivers else None
+        if key == sm.keys[c] and key_b == sm.keys_b[c]:
             continue
         mat = _light_matrix(r, u, d, box, z0, z1)
         texel = box[2] / RES
-        items, keep = _cascade_items(casters, r, u, box, texel, z1 - z0, wanted)
-        stats["tris"] = _render(sm, c, mat, items)
-        sm.keep[c] = keep
-        sm.keys[c] = key
+        if key != sm.keys[c]:
+            items, keep = _cascade_items(casters, r, u, box, texel, z1 - z0, wanted)
+            stats["tris"] = _render(sm, c, mat, items)
+            sm.keep[c] = keep
+            sm.keys[c] = key
+        if key_b is not None and key_b != sm.keys_b[c]:
+            _render(sm, MAX_CASCADES + c, mat, _ordinary_items(receivers, r, u, box))
+        sm.keys_b[c] = key_b
         sm.mats[c] = _TO_TEX @ mat
         sm.bias[c] = (texel, 1.0 / (z1 - z0), 0.0, 0.0)
     for c in range(n, MAX_CASCADES):
-        sm.keys[c] = None
+        sm.keys[c] = sm.keys_b[c] = None
         sm.keep[c] = None
     sm.count = n
     stats["cascades"] = n
-    ukey = (tuple(sm.keys[:n]), idx)
+    ukey = (tuple(sm.keys[:n]), tuple(sm.keys_b[:n]), idx)
     if ukey != sm.ubo_key:
-        sm.ubo = _ubo_data(sm.mats[:n], (float(idx), float(n), float(RES), 0.0), sm.bias[:n])
+        sm.ubo = _ubo_data(sm.mats[:n], (float(idx), float(n), float(RES), 1.0 if receivers else 0.0),
+                           sm.bias[:n])
         sm.ubo_key = ukey
     if wanted:
         frame["busy"] = True               # the live tick builds the wanted levels; the map redraws then
