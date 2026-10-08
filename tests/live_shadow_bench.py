@@ -139,15 +139,7 @@ def tick():
         space.shading.type = 'MATERIAL'
         space.shading.use_scene_lights = True
         space.shading.use_scene_world = True
-        # overlays on (Material Preview gives draw handlers no depth without them: ordinary meshes need it
-        # to receive Live Draw shadows), every element of them off
-        space.overlay.show_overlays = True
-        for prop in ("show_floor", "show_axis_x", "show_axis_y", "show_axis_z", "show_cursor", "show_text",
-                     "show_stats", "show_extras", "show_object_origins", "show_outline_selected",
-                     "show_relationship_lines", "show_bones", "show_motion_paths", "show_annotation"):
-            if hasattr(space.overlay, prop):
-                setattr(space.overlay, prop, False)
-        space.show_gizmo = False
+        space.overlay.show_overlays = False     # (Live Draw writes the ordinary meshes' depth itself)
         space.show_region_ui = False
         for o in bpy.context.view_layer.objects:
             o.select_set(False)

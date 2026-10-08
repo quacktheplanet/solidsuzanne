@@ -316,9 +316,27 @@ buffers; final renders and Rendered views keep the EEVEE/Cycles path above, unch
 - While it runs, the chunk meshes are emptied and their collections disabled in viewports (renders fill
   them again), and the instancing modifier is hidden from viewports only; that also spares Blender
   walking ~1,000 empty objects a frame.
+- **Sun shadows** (`addons/vgeo/shadows.py`; the scene toggle **Shadows** next to Live Draw, on by
+  default; the first visible sun whose own Shadow option is on casts, and the panel says when none does).
+  Up to three 2048² cascades split the part of the view that holds geometry; the light's depth range
+  covers the whole scene, so casters outside the view still shadow it. A proxy casts with its current
+  cut; an instancer casts every placement in a cascade with one shared level, the coarsest whose error is
+  under a shadow texel, pushed away from the light by twice that error so a coarse level can't shadow the
+  finer surface it stands in for. Sampling: 4x4 fetches weighted into a 3-texel tent (PCF), a one-texel
+  depth bias plus a slope-scaled part, and a normal offset; no acne or visible peter-panning on the
+  scenes below. A cascade re-renders only when its box (padded, kept while the view stays inside it),
+  the sun or its casters change: a still view renders no shadow map at all.
+- **Ordinary meshes** (not virtualized) take part too: they are uploaded once per geometry change (up to
+  2M triangles together) and cast into a second set of cascade layers, so they shadow virtualized
+  assets; and where virtualized assets shadow them, the same triangles are drawn again over Blender's
+  image, darkened by the shadowed/unshadowed ratio of Live Draw's own shading of their material.
+  Ordinary-on-ordinary shadows stay Blender's (EEVEE's in Material Preview, none in Solid). With overlays
+  hidden, Material Preview gives draw handlers no depth; Live Draw then writes the ordinary meshes'
+  depth itself (which also keeps virtualized assets from drawing over ordinary objects in front of
+  them, as they used to in that mode).
 
 Measured (RTX 5090, Blender 5.1.2, Vulkan, Xvfb window; flight forward through the scene with frames timed
-at a draw handler; `tests/live_draw_check.py` for the checks):
+at a draw handler; `tests/live_draw_check.py` for the checks, `tests/live_shadow_bench.py` for shadows):
 
 | | Blender-mesh path | Live Draw |
 |---|---|---|
@@ -328,21 +346,51 @@ at a draw handler; `tests/live_draw_check.py` for the checks):
 | Coastal cliff scan (1.54M), Solid / Material Preview | 15 / 18 ms | 15 / 16 ms |
 | Draw handler's own time | | 0.05-3 ms |
 | Orbiting a textured asset (live_draw_check) | | 10-12 ms median |
-| Looks like EEVEE: mean pixel difference | | 2.1/255 cliff, 3.5/255 field, 5.2/255 generated sphere |
+| Looks like EEVEE: mean pixel difference | | 2.1/255 cliff, 3.5/255 field, 3.2/255 live_draw_check scene (5.2 before its sphere had UVs and a ground) |
 
 ![Live Draw (left) and EEVEE (right), same view, Poly Haven cliff](images/live_draw_cliff_vs_eevee.jpg)
 ![Live Draw (left) and EEVEE (right), 1,000-copy field](images/live_draw_field_vs_eevee.jpg)
+
+What sun shadows cost, shadows on against off on the same path (8 m/s flight from the camera, 8 s; the
+CPU was shared with an 8-core benchmark, so frame medians move by ±1 ms between runs):
+
+| | Shadows off | Shadows on |
+|---|---|---|
+| 1,000-copy field (31M triangles drawn), Solid, flying: frame median | 24.1 ms | 23.5 ms (22.9 again) |
+| Same, Material Preview | 23.3 ms | 24.0 ms |
+| Same, draw handler's own time, Solid / Material Preview | 0.46 / 1.33 ms | 0.72 / 1.54 ms |
+| Same, shadow map updates while flying | | ~18 cascade renders a second (most are the small near cascade); update median 0.25 ms CPU, p95 1.4 ms |
+| Same, one cascade render waited on (GPU included) | | 0.4 ms median, 1.5 ms worst after the first; 7M triangles in the largest |
+| Cliff scan, Solid / Material Preview, flying: frame median | 9.6 / 10.2 ms | 10.2 / 10.3 ms |
+| Same, draw handler | 0.05 / 0.68 ms | 0.30 / 0.74 ms |
+| Same, shadow map updates | | ~25 a second: the proxy's cut swaps in ten times a second while moving, and the shadow uses it |
+| live_draw_check scene (sphere, ground, 60 copies, 2 ordinary meshes), orbiting in Solid | 11.7-12.2 ms, handler 0.13-0.15 ms | 12.2-13.0 ms, handler 0.46-0.54 ms (p95 0.6-0.85) |
+| Still view | | no shadow map renders |
+| Looks like EEVEE with sun shadows on: mean pixel difference | | 2.7/255 cliff, 4.0/255 field, 3.5/255 test scene; the pixels shadows darken overlap EEVEE's at 0.84 (intersection over union) |
+
+![Live Draw (left) and EEVEE (right) with sun shadows: sphere, instanced rocks, an ordinary slab and pillar](images/live_draw_shadows_vs_eevee.jpg)
+![Live Draw (left) and EEVEE (right) with sun shadows, 1,000-copy field on an ordinary ground plane](images/live_draw_field_shadows_vs_eevee.jpg)
+![Live Draw (left) and EEVEE (right) with sun shadows, cliff scan](images/live_draw_cliff_shadows_vs_eevee.jpg)
 
 Where the field's 37 ms goes: this window costs ~27 ms a frame on that flight path **with every object
 hidden** (Xvfb and Blender's own viewport; ~11 ms on other views), Live Draw's drawing adds ~4 ms at 30M
 triangles, and the live tick ~8 ms (selection and index buffers). The 60 fps target is not reached here;
 on a real display the baseline should be much lower, but that is not measured.
 
-Not in Live Draw (yet): shadows, ambient occlusion and screen-space effects (EEVEE has them; Live Draw is
-lit directly), procedural textures, extra UV maps and colour attributes in shading (they render), emission,
+Not in Live Draw (yet): shadows from point, spot and area lights and from a second sun (only the first
+sun with Shadow on casts); soft shadows from the sun's angle (the filter is a fixed 3-texel tent, about
+EEVEE's look for the default 0.5° sun, harder for wide suns); shadows cast or received by ordinary objects
+that aren't meshes (curves, text, volumes), by instances (geometry-nodes, collection or particle
+instances of ordinary objects) or by ordinary meshes beyond 2M triangles together; transparent or
+alpha-clipped casters (everything casts solid). Ambient occlusion and screen-space effects: EEVEE has
+them, Live Draw doesn't. Screen-space AO was weighed and left out: draw handlers can't sample the
+viewport's depth, and reading it back costs 3.3 ms a frame at 1311x878 (more at higher resolutions), five
+to ten times what the shadows cost; a depth pass of our own would redraw every triangle again. Also
+missing: procedural textures, extra UV maps and colour attributes in shading (they render), emission,
 transparency, metallic/roughness maps beyond a single image, and per-cluster back-face or occlusion
 culling (copies drawn by a shared level draw their back too). GPU memory: the whole vertex buffer stays
-resident (8M vertices = 256 MB for the 15M rock) plus the built levels.
+resident (8M vertices = 256 MB for the 15M rock) plus the built levels; shadow maps add 96 MB per 3D
+view that shows them (up to four views).
 
 ## Not yet
 
