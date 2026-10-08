@@ -10,15 +10,17 @@
 #include "io_util.h"
 
 #include "meshoptimizer.h"
-#include "clusterlod.h"
+#include "clusterlod_mt.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -99,6 +101,18 @@ struct KdTree {
         return nodes[n].chunk;
     }
 };
+
+// Threads for the LOD build: VGEO_BUILD_THREADS if set (1 = the original serial code), else the hardware
+// threads capped at 16 (past that the serial parts of each level dominate). The output does not depend on it.
+size_t build_thread_count() {
+    if (const char* env = std::getenv("VGEO_BUILD_THREADS")) {
+        char* end = nullptr;
+        long n = std::strtol(env, &end, 10);
+        if (end != env && n >= 1) return size_t(std::min(n, 256L));
+    }
+    unsigned hw = std::thread::hardware_concurrency();
+    return std::max<size_t>(1, std::min<size_t>(16, hw ? hw : 1));
+}
 
 }  // namespace
 
@@ -294,7 +308,9 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     uint64_t emitted_tris = 0;
     bool cancelled = false;
 
-    clodBuild(config, mesh, [&](clodGroup group, const clodCluster* cl, size_t count) -> int {
+    // groups are simplified in parallel but this callback still sees them one at a time, in the serial order,
+    // on this thread (so group ids, the file and the progress reports are the same for any thread count)
+    clodBuildThreaded(config, mesh, build_thread_count(), [&](clodGroup group, const clodCluster* cl, size_t count) -> int {
         int gid = int(groups.size());
         groups.push_back(group);
         for (size_t i = 0; i < count; ++i) {

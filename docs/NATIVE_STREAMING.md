@@ -101,7 +101,7 @@ Terrain demo: 33.5M triangles from Geometry Nodes (`examples/terrain_demo.py`).
 
 | | |
 |---|---|
-| Build (clusterlod, single thread) | 129-141 s, 19 LOD levels, 512 chunks, 1.2 GB file |
+| Build (clusterlod, single thread; now multi-threaded, see Building) | 129-141 s, 19 LOD levels, 512 chunks, 1.2 GB file |
 | Cut from the hero camera, 1080p, 1 px, off-screen coarsened | 2.5M triangles (7.4 %) |
 | Full rebuild of a 7.7M-triangle cut | 1.3 s |
 | Viewport idle, Solid / EEVEE | ~75 / ~55 fps |
@@ -213,6 +213,26 @@ cmake --build build-stream
 
 Needs a C++20 compiler; no Vulkan SDK, no Python headers. meshoptimizer is
 fetched at a pinned commit (or pass `-DVGEO_MESHOPTIMIZER_DIR=...`).
+
+**The LOD build uses several threads.** `src/stream/clusterlod_mt.h` is meshoptimizer's
+`demo/clusterlod.h` (1.3, commit 9e1f07b), vendored with its changes marked `VGEO:`:
+- Within each DAG level, the groups are simplified and re-clusterized on a small thread pool.
+- They are still output and numbered in the original order on the calling thread, so the file is
+  **byte-identical for any thread count**. That was checked against the previous serial library on a
+  small mesh at 12 thread counts, and on 4M- and 10M-triangle terrains.
+- `VGEO_BUILD_THREADS=N` sets the count. 1 runs the original serial code. The default is the hardware
+  threads, capped at 16.
+- Border dilation, if it were turned on, would make groups depend on each other, so it falls back to
+  serial.
+- Built clean under AddressSanitizer and UBSan.
+
+| Generated terrain | 1 thread | default (16) | LOD levels alone |
+|---|---|---|---|
+| 4M triangles | 11.9 s | 5.9 s | 7.9 → 1.2 s |
+| 10M triangles | 29.0 s | 15.0 s | 16.8 → 3.4 s |
+
+Measured on a shared 128-thread Xeon with the load average near 50. The rest of the time is the
+initial clustering and partitioning, still single-threaded and the next thing to split.
 The DLL links the C runtime statically so it loads inside Blender with no
 redistributable installed.
 

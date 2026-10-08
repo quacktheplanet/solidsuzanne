@@ -27,9 +27,11 @@ add_library(vgeo_stream SHARED
 target_include_directories(vgeo_stream PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${meshoptimizer_SOURCE_DIR}/src
-    ${meshoptimizer_SOURCE_DIR}/demo
 )
 set_target_properties(vgeo_stream PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+# the LOD build (clusterlod_mt.h) uses std::thread
+find_package(Threads REQUIRED)
+target_link_libraries(vgeo_stream PRIVATE Threads::Threads)
 if(MSVC)
     target_compile_options(vgeo_stream PRIVATE /O2 /W3 /wd4996)
     # static CRT: the DLL must load inside Blender with no redistributable installed
