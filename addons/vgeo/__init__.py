@@ -331,11 +331,17 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.label(text=native.library_path())
             return
         from . import livedraw
+        scene = context.scene
         row = layout.row(align=True)
-        row.prop(context.scene, "vgeo_live_draw", toggle=True, icon='SHADING_TEXTURE')
-        if context.scene.vgeo_live_draw:
+        row.prop(scene, "vgeo_live_draw", toggle=True, icon='SHADING_TEXTURE')
+        sub = row.row(align=True)
+        sub.active = scene.vgeo_live_draw
+        sub.prop(scene, "vgeo_live_shadows", toggle=True, icon='LIGHT_SUN')
+        if scene.vgeo_live_draw:
             if livedraw.is_active():
                 layout.label(text=f"Drawing {livedraw.drawn_triangles():,} triangles", icon='INFO')
+                if scene.vgeo_live_shadows and not livedraw.shadow_light_found(scene):
+                    layout.label(text="No sun with Shadow on: unshadowed", icon='LIGHT_SUN')
             else:
                 layout.label(text="Off while a view is in Rendered shading", icon='INFO')
         if ob is not None and ob.vgeo_inst.uid:
@@ -402,6 +408,12 @@ def _menu(self, _context):
     self.layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
 
 
+def _redraw_views(_self, context):
+    for area in context.screen.areas if context.screen else []:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
@@ -412,6 +424,11 @@ def register():
         description="Draw virtualized assets straight from GPU buffers in Solid and Material Preview views "
                     "(fast, view-dependent cuts for every copy). Final renders and Rendered views use EEVEE "
                     "or Cycles with real meshes either way")
+    bpy.types.Scene.vgeo_live_shadows = BoolProperty(
+        name="Shadows", default=True, update=_redraw_views,
+        description="Sun shadows in Live Draw: the first sun whose Shadow option is on shadows every "
+                    "virtualized asset and copy. Final renders and Rendered views use EEVEE or Cycles "
+                    "shadows either way")
     bpy.types.VIEW3D_MT_object.append(_menu)
     stream.register()
     from . import livedraw
@@ -424,6 +441,7 @@ def unregister():
     stream.unregister()
     bpy.types.VIEW3D_MT_object.remove(_menu)
     del bpy.types.Scene.vgeo_live_draw
+    del bpy.types.Scene.vgeo_live_shadows
     del bpy.types.Object.vgeo_inst
     del bpy.types.Object.vgeo
     for c in reversed(classes):
