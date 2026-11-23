@@ -164,17 +164,56 @@ boulder = 2.6 billion source triangles.
 | Viewport while flying | Solid ~117 fps, EEVEE ~68-79 fps, worst frame 42-45 ms |
 
 **Streamed copies.** A whole-asset level wastes triangles on a copy seen up
-close: level 0 is the entire asset at full detail, though most of it is far
-away or facing away. Copies that want level 0 (nearest first, up to
-**Streamed Copies**, default 4, only for assets whose level 0 is at least
-20k triangles) are shown by a streamed copy instead: a VGEO proxy parented
+close: its level must be fine enough for the copy's nearest point, so the rest
+of it (far away or facing away) is drawn at that detail too. The copies whose
+level meshes cost the most triangles, at any level (up to **Streamed Copies**,
+default 8, and only copies whose level mesh is at least 20k triangles), are
+shown by a streamed copy instead: a VGEO proxy parented
 to the instancer, placed like the copy, hidden from selection, streaming a
-view-dependent cut through the same live loop. It starts empty; the copy
+view-dependent cut through the same live loop. A copy that holds a streamed
+copy keeps it until another costs 1.5x more, so slots do not flip back and
+forth as the view moves. It starts empty; the copy
 keeps its instance until the streamed cut has landed, then the instance is
 dropped (a `vgeo_streamed` point attribute feeds Instance on Points'
 Selection) in the same tick, so there is never a gap or a doubled surface.
 Walking away hands the copy back and empties the streamed copy. Final
 renders make the streamed cuts synchronously.
+
+**Off-screen copies.** The instancer's **Off-screen** setting decides what
+happens to copies outside the view (in the viewport and in final renders):
+
+- **Coarsen** (default): kept, with the error multiplied by **Off-screen
+  Error** (8), so they still cast shadows and show in reflections.
+- **Sun Shadows**: dropped, unless their shadow from a sun lamp can reach the
+  view. The test sweeps the copy's bounding sphere along the sun's light by
+  **Shadow Reach** (0 = estimated from the copy's size and the sun's height)
+  and keeps it unless the swept sphere lies fully outside one frustum plane.
+  Point and spot shadows and reflections of dropped copies are lost.
+- **Cull**: every copy outside the view is dropped.
+
+Dropped copies get level -1, which the Instance on Points selection leaves
+out (`vgeo_level >= 0`, added in place to node groups from older files).
+
+![Off-screen modes](images/offscreen_modes.jpg)
+
+*Looking away from a low sun: Coarsen (1.23M triangles), Sun Shadows (947k,
+pixel-identical) and Cull (891k, the long shadows of statues behind the camera
+are gone).*
+
+Measuring it: `tools/instancing_bench.py` reports, per camera and instancer,
+what the add-on draws against a meshlet cut on every copy (with and without
+off-screen copies). On the 4.36-billion-triangle statue scene from the Blender
+demo film (1,704 statues of 1.43M triangles, 1,188 floor patches of 1.62M,
+1280x720, 1.5 px, mean of 8 film cameras):
+
+| | Triangles drawn |
+|---|---|
+| Before (level-0 copies only get streamed copies, 6+8 of them) | 2.77M |
+| Heaviest copies streamed, 8 per instancer, Coarsen | 1.78M |
+| Same, Sun Shadows | 1.57M |
+| Same, Cull | 1.51M |
+| Meshlet cut on every copy, off-screen coarsened (ideal, Coarsen) | 1.67M |
+| Meshlet cut on every copy, off-screen skipped (ideal, Cull) | 1.24M |
 
 Scatter demo, viewport 1.8 radii from a boulder (`tests/slot_gui_check.py`):
 the boulder's streamed cut is 353k triangles instead of 1.31M for level 0,
@@ -221,6 +260,8 @@ redistributable installed.
 ```
 blender -b --factory-startup --python tests/test_stream.py
 blender scene.blend --python tests/viewport_bench.py -- --motion fly|orbit
+blender -b scene.blend --python tools/instancing_bench.py -- --cameras cams.json --offscreen COARSEN,SHADOWS,CULL
+blender -b --factory-startup --python tools/instancing_bench.py -- --synthetic
 ```
 
 ## Toward the web

@@ -9,9 +9,10 @@ integer attribute; a Geometry Nodes tree instances the chosen level mesh at
 each point. Navigating never rebuilds geometry, and EEVEE and Cycles get
 real instances (one copy of each level in memory, however many placements).
 
-Whole-asset levels waste triangles on a copy seen up close: level 0 is the
-entire asset at full detail, though most of it is far away or off-screen.
-The few copies that want level 0 (`stream_slots`, nearest first) are shown
+Whole-asset levels waste triangles on a copy seen up close: its level must
+be fine enough for its nearest point, so the rest of it (far away or
+off-screen) is drawn at that detail too. The copies whose level meshes cost
+the most triangles (`stream_slots` of them, at any level) are shown
 by streamed copies instead: hidden-from-selection VGEO proxies parented to
 the instancer, placed like the copy, streaming a view-dependent cut through
 the normal live loop. A copy is only switched over (its instance dropped via
@@ -23,6 +24,7 @@ import math
 
 import bpy
 import numpy as np
+from mathutils import Vector
 
 from . import native, stream
 
@@ -31,7 +33,8 @@ LEVEL_ATTR = "vgeo_level"
 ROT_ATTR = "vgeo_rot"
 SCALE_ATTR = "vgeo_scale"
 STREAMED_ATTR = "vgeo_streamed"   # bool per point: shown by a streamed copy, not an instance
-STREAM_MIN_TRIS = 20_000          # below this, a whole-asset level 0 is cheap enough
+STREAM_MIN_TRIS = 20_000          # a copy whose level mesh is smaller than this is cheap enough as it is
+SLOT_KEEP_BONUS = 1.5             # a copy keeps its streamed cut until another costs this much more
 
 _levels_cache = {}   # instancer uid -> (errors ndarray, tris ndarray)
 
@@ -45,6 +48,7 @@ def ensure_node_group():
     ng = bpy.data.node_groups.get(NODE_GROUP)
     if ng and ng.bl_idname == "GeometryNodeTree" and "Levels" in ng.interface.items_tree:
         _ensure_streamed_selection(ng)
+        _ensure_culled_selection(ng)
         return ng
     ng = bpy.data.node_groups.new(NODE_GROUP, "GeometryNodeTree")
     ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
@@ -79,6 +83,7 @@ def ensure_node_group():
     out = n.new("NodeGroupOutput")
     L.new(iop.outputs["Instances"], out.inputs["Geometry"])
     _ensure_streamed_selection(ng)
+    _ensure_culled_selection(ng)
     return ng
 
 
@@ -98,6 +103,40 @@ def _ensure_streamed_selection(ng):
     inv.operation = 'NOT'
     ng.links.new(a.outputs["Attribute"], inv.inputs[0])
     ng.links.new(inv.outputs[0], iop.inputs["Selection"])
+
+
+def _ensure_culled_selection(ng):
+    """Culled placements (level -1) are left out too: Selection = not vgeo_streamed and vgeo_level >= 0.
+    Added in place, so node groups from older files keep working."""
+    if ng.nodes.get("VGEO shown") is not None:
+        return
+    iop = next((x for x in ng.nodes if x.bl_idname == "GeometryNodeInstanceOnPoints"), None)
+    if iop is None:
+        return
+    sel = iop.inputs["Selection"]
+    prev = sel.links[0].from_socket if sel.is_linked else None
+    lvl = next((x for x in ng.nodes if x.bl_idname == "GeometryNodeInputNamedAttribute"
+                and x.inputs["Name"].default_value == LEVEL_ATTR), None)
+    if lvl is None:
+        lvl = ng.nodes.new("GeometryNodeInputNamedAttribute")
+        lvl.data_type = 'INT'
+        lvl.inputs["Name"].default_value = LEVEL_ATTR
+    cmp = ng.nodes.new("FunctionNodeCompare")
+    cmp.name = cmp.label = "VGEO not culled"
+    cmp.data_type = 'INT'
+    cmp.operation = 'GREATER_EQUAL'
+    a_in, b_in = [x for x in cmp.inputs if x.type == 'INT'][:2]
+    b_in.default_value = 0
+    ng.links.new(lvl.outputs["Attribute"], a_in)
+    both = ng.nodes.new("FunctionNodeBooleanMath")
+    both.name = both.label = "VGEO shown"
+    both.operation = 'AND'
+    if prev is not None:
+        ng.links.new(prev, both.inputs[0])
+    else:
+        both.inputs[0].default_value = True
+    ng.links.new(cmp.outputs[0], both.inputs[1])
+    ng.links.new(both.outputs[0], sel)
 
 
 def _socket_id(ng, name):
@@ -175,13 +214,50 @@ def _points(inst):
     return co.reshape(-1, 3), scale
 
 
-def choose_levels(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
-    """Per placement, the coarsest level that keeps the error under the threshold in every view."""
+def choose_levels(inst, views, pixel_error, mode=None, offscreen_scale=None):
+    """Per placement, the coarsest level that keeps the error under the threshold in every view
+    (-1: the copy is not drawn)."""
     return _choose(inst, views, pixel_error, mode, offscreen_scale)[0]
 
 
-def _choose(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
-    """(levels, allowed error in asset units) per placement."""
+def _scene_of(inst):
+    return inst.users_scene[0] if inst.users_scene else bpy.context.scene
+
+
+def sun_directions(scene):
+    """World-space directions the light of each shadow-casting sun lamp travels in (unit vectors)."""
+    out = []
+    for ob in scene.objects if scene is not None else ():
+        if ob.type == 'LIGHT' and ob.data.type == 'SUN' and not ob.hide_render and \
+                getattr(ob.data, "use_shadow", True):
+            d = np.array(ob.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
+            n = np.linalg.norm(d)
+            if n > 0:
+                out.append(d / n)
+    return out
+
+
+def _shadow_reaches(dist, planes, radius, suns, reach):
+    """Copies outside the view whose shadow can land in it: the copy's bounding sphere swept along
+    each sun's light by `reach` must not lie fully outside any one frustum plane (conservative).
+    dist: (n, 6) signed distances of the copy centres to the planes."""
+    hit = np.zeros(len(dist), bool)
+    for d in suns:
+        nd = planes[:, :3] @ d                         # how fast each plane distance changes along d
+        if reach is None:   # the shadow of a copy about 2r tall, cast onto ground at its base
+            r = 2.0 * radius / max(-d[2], 0.1)
+        else:
+            r = np.full(len(dist), reach)
+        swept = dist + r[:, None] * np.maximum(nd, 0.0)[None, :]
+        hit |= np.all(swept >= -radius[:, None], axis=1)
+    return hit
+
+
+def _choose(inst, views, pixel_error, mode=None, offscreen_scale=None):
+    """(levels, allowed error in asset units) per placement. Level -1: not drawn (culled)."""
+    vi = inst.vgeo_inst
+    mode = mode or getattr(vi, "offscreen", "COARSEN")
+    offscreen_scale = offscreen_scale or getattr(vi, "offscreen_scale", 8.0)
     errors, _tris = _level_tables(inst)
     co, scale = _points(inst)
     n = len(co)
@@ -192,6 +268,10 @@ def _choose(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
     s = scale.astype(np.float64) * max(abs(x) for x in inst.matrix_world.to_scale())
     radius = float(inst.get("vgeo_radius", 1.0)) * s
     budget = np.full(n, np.inf)
+    culling = mode in ("CULL", "SHADOWS")
+    keep = np.zeros(n, bool) if culling else np.ones(n, bool)
+    suns = sun_directions(_scene_of(inst)) if mode == "SHADOWS" else []
+    reach = getattr(vi, "shadow_distance", 0.0) or None
     for view, window, height, persp, clip_start in views:
         cam = np.array(view.inverted().translation, dtype=np.float64)
         t = pixel_error / max(1, height)
@@ -202,15 +282,19 @@ def _choose(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0):
             b = np.full(n, t * (2.0 / window[1][1] if window[1][1] else 1.0))
         if mode != "FULL":
             planes = np.array(stream._frustum_planes(window @ view), dtype=np.float64)
-            inside = np.all(world @ planes[:, :3].T + planes[:, 3] >= -radius[:, None], axis=1)
-            if mode == "COARSEN":
-                b = np.where(inside, b, b * offscreen_scale)
-            else:   # CULL has no meaning for instances that cast shadows; treat as coarsen
-                b = np.where(inside, b, b * max(offscreen_scale, 64.0))
+            dist = world @ planes[:, :3].T + planes[:, 3]
+            inside = np.all(dist >= -radius[:, None], axis=1)
+            b = np.where(inside, b, b * offscreen_scale)
+            if culling:
+                keep |= inside
+                if suns:
+                    keep |= _shadow_reaches(dist, planes, radius, suns, reach)
         budget = np.minimum(budget, b / s)   # error allowed in asset units
     levels = np.searchsorted(errors, budget, side="right") - 1
-    levels = np.clip(levels, int(inst.vgeo_inst.min_level), len(errors) - 1)
-    return levels.astype(np.int32), budget
+    levels = np.clip(levels, int(vi.min_level), len(errors) - 1).astype(np.int32)
+    levels[~keep] = -1
+    budget[~keep] = np.inf
+    return levels, budget
 
 
 def apply_levels(inst, levels):
@@ -225,6 +309,8 @@ def apply_levels(inst, levels):
     a.data.foreach_get("value", cur)
     if np.array_equal(cur, levels):
         return False
+    if (levels < 0).any():
+        ensure_node_group()   # older node groups lack the selection that leaves culled copies out
     a.data.foreach_set("value", levels)
     me.update()
     return True
@@ -234,14 +320,18 @@ def triangles_for(inst, levels, streamed=None):
     _errors, tris = _level_tables(inst)
     if not len(levels):
         return 0
+    shown = levels >= 0
     if streamed is not None and streamed.any():
-        return int(tris[levels[~streamed]].sum())
-    return int(tris[levels].sum())
+        shown &= ~streamed
+    return int(tris[levels[shown]].sum())
 
 
-def update(inst, views, pixel_error, mode="COARSEN", offscreen_scale=8.0, render=False):
+def update(inst, views, pixel_error, mode=None, offscreen_scale=None, render=False):
     """Choose levels and streamed copies for these views. render=True: the streamed copies get
-    their cut now and take over at once (final renders are synchronous)."""
+    their cut now and take over at once (final renders are synchronous). mode and offscreen_scale
+    default to the instancer's Off-screen settings."""
+    mode = mode or getattr(inst.vgeo_inst, "offscreen", "COARSEN")
+    offscreen_scale = offscreen_scale or getattr(inst.vgeo_inst, "offscreen_scale", 8.0)
     levels, budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
     changed = apply_levels(inst, levels)
     wanted = _wanted_slots(inst, levels, budget)
@@ -333,16 +423,34 @@ def _remove_slot(ob):
         bpy.data.meshes.remove(me)
 
 
+def _held_slots(inst, n):
+    """Placements that have a streamed copy assigned (landed or not)."""
+    held = np.zeros(n, bool)
+    for ob in slots(inst):
+        if 0 <= ob.vgeo.slot_index < n:
+            held[ob.vgeo.slot_index] = True
+    return held
+
+
 def _wanted_slots(inst, levels, budget):
-    """Placements that should be streamed: they want the finest level and it is big, nearest first."""
+    """Placements that should be streamed: the ones whose whole-copy level costs the most triangles.
+
+    A whole-copy level must be fine enough for the copy's nearest point, so a big copy close to the
+    camera draws its far side at that detail too; a streamed cut is fine only where it needs to be.
+    The heaviest level meshes gain the most, whatever their level. Copies that already hold a slot
+    keep it unless another costs clearly more, so slots do not flip back and forth as the view moves."""
     k = int(inst.vgeo_inst.stream_slots)
     _errors, tris = _level_tables(inst)
-    if k <= 0 or not len(levels) or tris[0] < STREAM_MIN_TRIS or int(inst.vgeo_inst.min_level) > 0:
+    if k <= 0 or not len(levels) or int(inst.vgeo_inst.min_level) > 0:
         return []
-    cand = np.nonzero(levels == 0)[0]
+    cost = np.where(levels >= 0, tris[np.clip(levels, 0, len(tris) - 1)], 0).astype(np.float64)
+    cand = np.nonzero(cost >= STREAM_MIN_TRIS)[0]
     if not len(cand):
         return []
-    return [int(i) for i in cand[np.argsort(budget[cand], kind="stable")][:k]]
+    score = cost[cand]
+    score[_held_slots(inst, len(levels))[cand]] *= SLOT_KEEP_BONUS
+    order = np.lexsort((budget[cand], -score))   # costliest first; the nearer copy wins a tie
+    return [int(i) for i in cand[order][:k]]
 
 
 def _streamed_flags(inst):

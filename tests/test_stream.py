@@ -482,7 +482,7 @@ def run():
     sl = instances.slots(inst)
     assigned = sorted(o.vgeo.slot_index for o in sl if o.vgeo.slot_index >= 0)
     flags = instances._streamed_flags(inst)
-    check("streamed copies assigned to the nearest full-detail copies",
+    check("streamed copies assigned to the heaviest copies, the close-up one first",
           len(sl) == 2 and target in assigned and all(o.hide_select for o in sl), str(assigned))
     check("instance kept until the streamed cut lands", not flags.any())
     for _ in range(400):
@@ -537,6 +537,93 @@ def run():
         check(f"{eng} renders the instancer", os.path.exists(scene.render.filepath))
     shown_render = inst.vgeo_inst.shown_triangles
     check("render cut uses the render error", shown_render > 0, f"{shown_render:,} tris at 0.5 px")
+
+    # streamed copies go to the copies whose level meshes cost the most, at any level (a copy that
+    # wants level 1 up close wastes as much as one that wants level 0); a copy that holds one keeps
+    # it against an equally heavy copy, so slots do not flip back and forth
+    inst.vgeo_inst.stream_slots = 2
+    instances.assign_slots(inst, [])
+    n = len(inst.data.vertices)
+    lv_fake = np.full(n, len(lvl_tris) - 1, np.int32)
+    a, b, c = 5, 17, 42
+    lv_fake[[a, b, c]] = [1, 2, 2]
+    nearness = np.arange(n, dtype=np.float64)   # lower index = nearer
+    want = instances._wanted_slots(inst, lv_fake, nearness)
+    check("streamed copies go to the heaviest copies, at any level", want == [a, b], str(want))
+    instances.assign_slots(inst, [a, c])
+    want = instances._wanted_slots(inst, lv_fake, nearness)
+    check("a copy keeps its streamed cut against an equally heavy one", want == [a, c], str(want))
+    instances.assign_slots(inst, [])
+
+    # off-screen copies: Cull leaves them out of the instancing, and draws fewer triangles
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    views = [stream.camera_view(scene)]
+    inst.vgeo_inst.stream_slots = 0
+    inst.vgeo_inst.offscreen = 'COARSEN'
+    instances.update(inst, views, 1.0)
+    coarsen_tris = inst.vgeo_inst.shown_triangles
+    inst.vgeo_inst.offscreen = 'CULL'
+    instances.update(inst, views, 1.0)
+    lv = np.empty(n, np.int32)
+    inst.data.attributes["vgeo_level"].data.foreach_get("value", lv)
+    culled = int((lv < 0).sum())
+    dg = bpy.context.evaluated_depsgraph_get()
+    n_inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == inst)
+    check("cull leaves copies outside the view out", 0 < culled < n and n_inst == n - culled,
+          f"{culled} culled, {n_inst} instanced")
+    check("culling draws fewer triangles", inst.vgeo_inst.shown_triangles < coarsen_tris,
+          f"{inst.vgeo_inst.shown_triangles:,} vs {coarsen_tris:,}")
+
+    # Sun Shadows: one copy in view, one left of it, one right of it; the light comes from the left,
+    # so only the left copy's shadow can fall into the view
+    lights = {o.name: o.hide_render for o in scene.objects if o.type == 'LIGHT'}
+    for name in lights:
+        scene.objects[name].hide_render = True
+    sun = bpy.data.objects.new("ShadowSun", bpy.data.lights.new("ShadowSun", "SUN"))
+    sun.rotation_euler = Vector((1.0, 0.0, -0.3)).to_track_quat('-Z', 'Y').to_euler()
+    scene.collection.objects.link(sun)
+    me = bpy.data.meshes.new("ShadowTest")
+    pts3 = np.array([(0, 20, 0), (-22, 20, 0), (22, 20, 0)], np.float32)
+    me.vertices.add(3)
+    me.vertices.foreach_set("co", pts3.ravel())
+    me.attributes.new(instances.LEVEL_ATTR, 'INT', 'POINT')
+    me.update()
+    st = bpy.data.objects.new("ShadowTest", me)
+    scene.collection.objects.link(st)
+    st.vgeo_inst.uid = stream.new_uid()
+    st.vgeo_inst.source = proxy
+    st.vgeo_inst.stream_slots = 0
+    instances.build_levels(st, proxy)
+    camera((0, -12, 1.5), target=(0, 20, 1.5), lens=35)
+    bpy.context.view_layer.update()
+    views = [stream.camera_view(scene)]
+    st.vgeo_inst.offscreen = 'SHADOWS'
+    instances.update(st, views, 1.0)
+    lv3 = np.empty(3, np.int32)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    dg = bpy.context.evaluated_depsgraph_get()
+    n3 = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == st)
+    check("sun shadows keep the copy whose shadow reaches the view",
+          lv3[0] >= 0 and lv3[1] >= 0 and lv3[2] < 0 and n3 == 2, f"levels {lv3.tolist()}, {n3} instanced")
+    st.vgeo_inst.offscreen = 'CULL'
+    instances.update(st, views, 1.0)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    check("cull drops it", lv3[0] >= 0 and lv3[1] < 0 and lv3[2] < 0, str(lv3.tolist()))
+    sun.hide_render = True
+    st.vgeo_inst.offscreen = 'SHADOWS'
+    instances.update(st, views, 1.0)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    check("without a sun, sun shadows culls like Cull", lv3[1] < 0, str(lv3.tolist()))
+    col = st.vgeo_inst.levels
+    bpy.data.objects.remove(st)
+    for o in list(col.objects):
+        bpy.data.objects.remove(o)
+    bpy.data.collections.remove(col)
+    bpy.data.objects.remove(sun)
+    for name, hidden in lights.items():
+        scene.objects[name].hide_render = hidden
+    inst.vgeo_inst.offscreen = 'COARSEN'
+    inst.vgeo_inst.stream_slots = 2
     bpy.ops.wm.save_mainfile()
     bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
     inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)

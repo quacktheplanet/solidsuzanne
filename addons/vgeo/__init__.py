@@ -70,10 +70,24 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
     render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0, subtype='PIXEL')
     min_level: IntProperty(name="Finest Level", default=0, min=0, soft_max=8,
                            description="Never use levels finer than this (caps memory for very dense assets)")
-    stream_slots: IntProperty(name="Streamed Copies", default=4, min=0, max=16,
-                              description="Copies close enough to want full detail get a view-dependent "
-                                          "streamed cut of their own instead of a whole-asset level "
-                                          "(fine where you look, coarse elsewhere); at most this many")
+    stream_slots: IntProperty(name="Streamed Copies", default=8, min=0, max=64,
+                              description="The copies whose whole-asset level costs the most triangles get a "
+                                          "view-dependent streamed cut of their own instead (fine where you "
+                                          "look, coarse elsewhere); at most this many")
+    offscreen: EnumProperty(
+        name="Off-screen", default='COARSEN',
+        items=[('COARSEN', "Coarsen", "Keep copies outside the view at reduced detail, so they still cast "
+                                      "shadows and show in reflections"),
+               ('SHADOWS', "Sun Shadows", "Drop copies outside the view unless their shadow from a sun lamp can "
+                                          "reach it (point and spot shadows and reflections of dropped copies "
+                                          "are lost; without a sun lamp this is the same as Cull)"),
+               ('CULL', "Cull", "Drop every copy outside the view (fastest; their shadows and reflections "
+                                "are lost)")])
+    offscreen_scale: FloatProperty(name="Off-screen Error", default=8.0, min=1.0, soft_max=64.0,
+                                   description="Error multiplier for copies outside the view that are kept")
+    shadow_distance: FloatProperty(name="Shadow Reach", default=0.0, min=0.0, subtype='DISTANCE',
+                                   description="How far a copy's shadow can reach along the sun's light. "
+                                               "0 estimates it from the copy's size and the sun's height")
     freeze: BoolProperty(name="Freeze", default=False)
     shown_triangles: IntProperty(name="Shown Triangles", options={'HIDDEN'})
 
@@ -344,6 +358,11 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.prop(vi, "render_pixel_error")
             layout.prop(vi, "min_level")
             layout.prop(vi, "stream_slots")
+            layout.prop(vi, "offscreen")
+            if vi.offscreen != 'CULL':
+                layout.prop(vi, "offscreen_scale")
+            if vi.offscreen == 'SHADOWS':
+                layout.prop(vi, "shadow_distance")
             row = layout.row(align=True)
             row.prop(vi, "freeze", toggle=True, icon='FREEZE')
             row.operator(VGEO_OT_rebuild_levels.bl_idname, icon='FILE_REFRESH')
