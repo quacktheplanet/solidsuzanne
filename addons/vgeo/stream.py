@@ -933,6 +933,20 @@ def _on_render_pre(scene, depsgraph=None):
 
 
 @persistent
+def _on_frame_change_post(scene, depsgraph=None):
+    # Animation renders: render_pre reads the camera from the view layer's depsgraph, which
+    # the render pipeline does not move to the new frame, so the cut could stay on an old
+    # frame's camera for the rest of the render. After a frame change the handler gets the
+    # render's own depsgraph, evaluated at the frame about to be rendered: cut from that.
+    if not _rendering:
+        return
+    try:
+        update_for_render(scene, depsgraph)
+    except Exception as e:
+        print("VGEO render cut failed:", e)
+
+
+@persistent
 def _on_render_done(scene, depsgraph=None):
     global _rendering
     _rendering = False
@@ -969,7 +983,8 @@ def register():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
                     (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
-                    (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
+                    (h.undo_post, _on_undo), (h.redo_post, _on_undo),
+                    (h.frame_change_post, _on_frame_change_post)):
         if fn not in lst:
             lst.append(fn)
     if not bpy.app.timers.is_registered(_tick):
@@ -980,7 +995,8 @@ def unregister():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
                     (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
-                    (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
+                    (h.undo_post, _on_undo), (h.redo_post, _on_undo),
+                    (h.frame_change_post, _on_frame_change_post)):
         while fn in lst:
             lst.remove(fn)
     if bpy.app.timers.is_registered(_tick):
