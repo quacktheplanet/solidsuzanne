@@ -19,6 +19,7 @@ streamed into ordinary meshes, so EEVEE and Cycles render it with full
 materials, lights and shadows. A 33.5M-triangle terrain streams at ~28 fps
 while moving and renders in Cycles from a cut of a few million triangles.
 See [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
+Where it is going: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 The sections below describe the original Vulkan proof of concept.
 
