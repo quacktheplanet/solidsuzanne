@@ -8,8 +8,8 @@ with full materials while Blender only ever holds what the view needs.
 bl_info = {
     "name": "VGEO Virtualized Geometry",
     "author": "Lucas DeMeritt",
-    "version": (0, 2, 0),
-    "blender": (5, 0, 0),
+    "version": (0, 3, 0),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > VGEO",
     "description": "Nanite-style streamed LOD for huge meshes, rendered natively by EEVEE and Cycles",
     "category": "Object",

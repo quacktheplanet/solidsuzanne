@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -39,6 +40,79 @@ struct OutCluster {
     float center[3];
     float radius;
 };
+
+// Simplification can leave "fins": two triangles on the same three positions with opposite winding
+// (a zero-volume sliver, often across a normal or UV seam). Renderers show them as dark specks.
+// A free fin adds two uses to each of its edges, so dropping both triangles keeps the surface closed;
+// a fin plugging a hole (its edges otherwise used once) keeps the side that agrees with its neighbours;
+// a fin whose edges disagree (rare) stays, as removing either side would open an edge.
+// pos_id: per vertex, an id shared by vertices at the same position. Marks the fins' triangles in
+// drop (one byte per triangle) and returns how many.
+size_t find_fins(const std::vector<uint32_t>& tris, const std::vector<uint32_t>& pos_id, std::vector<uint8_t>& drop) {
+    const size_t n = tris.size() / 3;
+    drop.assign(n, 0);
+    if (n < 2) return 0;
+    struct Key { uint32_t a, b, c; };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> by_key;   // hash of the sorted triple -> triangles
+    by_key.reserve(n * 2);
+    std::vector<Key> keys(n);
+    std::vector<uint8_t> parity(n);
+    for (size_t t = 0; t < n; ++t) {
+        uint32_t p[3] = {pos_id[tris[t * 3]], pos_id[tris[t * 3 + 1]], pos_id[tris[t * 3 + 2]]};
+        // orientation: parity of the permutation that sorts the triple
+        uint8_t swaps = 0;
+        if (p[0] > p[1]) { std::swap(p[0], p[1]); ++swaps; }
+        if (p[1] > p[2]) { std::swap(p[1], p[2]); ++swaps; }
+        if (p[0] > p[1]) { std::swap(p[0], p[1]); ++swaps; }
+        keys[t] = {p[0], p[1], p[2]};
+        parity[t] = swaps & 1;
+        if (p[0] == p[1] || p[1] == p[2]) continue;   // degenerate: not a fin
+        uint64_t h = (uint64_t(p[0]) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(p[1]) * 0xC2B2AE3D27D4EB4Full) ^
+                     (uint64_t(p[2]) * 0x165667B19E3779F9ull);
+        by_key[h].push_back(uint32_t(t));
+    }
+    // directed edge uses (position ids) of every triangle, to tell a free fin from one that plugs a hole
+    std::unordered_map<uint64_t, int> directed;
+    directed.reserve(n * 4);
+    auto pid = [&](size_t t, int k) { return pos_id[tris[t * 3 + k]]; };
+    auto dkey = [](uint32_t u, uint32_t v) { return (uint64_t(u) << 32) | v; };
+    for (size_t t = 0; t < n; ++t)
+        for (int k = 0; k < 3; ++k) ++directed[dkey(pid(t, k), pid(t, (k + 1) % 3))];
+    size_t removed = 0;
+    for (auto& kv : by_key) {
+        std::vector<uint32_t>& list = kv.second;
+        if (list.size() < 2) continue;
+        for (size_t i = 0; i < list.size(); ++i) {
+            const uint32_t a = list[i];
+            if (drop[a]) continue;
+            for (size_t j = i + 1; j < list.size(); ++j) {
+                const uint32_t b = list[j];
+                if (drop[b] || parity[a] == parity[b]) continue;
+                if (keys[a].a != keys[b].a || keys[a].b != keys[b].b || keys[a].c != keys[b].c) continue;
+                // other triangles on a's edges: a's directed edge u->v is matched by the fin's b (v->u),
+                // so neighbours using v->u or u->v beyond the pair tell whether a hole is being plugged
+                int odd = 0;
+                bool a_clashes = false;
+                for (int k = 0; k < 3; ++k) {
+                    uint32_t u = pid(a, k), v = pid(a, (k + 1) % 3);
+                    int same = directed[dkey(u, v)] - 1;      // without a itself
+                    int rev = directed[dkey(v, u)] - 1;       // without b itself
+                    if ((same + rev) & 1) ++odd;
+                    if (same > 0) a_clashes = true;           // a neighbour already runs u->v: a is reversed
+                }
+                if (odd == 0) {
+                    drop[a] = drop[b] = 1;                    // a free fin: both go
+                    removed += 2;
+                } else if (odd == 3) {
+                    drop[a_clashes ? a : b] = 1;              // plugs a hole: keep the consistent side
+                    removed += 1;
+                }   // mixed: dropping either would open an edge; leave the pair as it is
+                break;
+            }
+        }
+    }
+    return removed;
+}
 
 void set_err(char* err, int err_len, const std::string& msg) {
     if (err && err_len > 0) {
@@ -256,6 +330,30 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     // keep hard edges, UV seams and material borders intact (attributes nx ny nz u v mat)
     mesh.attribute_protect_mask = 0x3F;
 
+    // vertices at the same position share an id (vertices are split by normals, UVs, materials)
+    std::vector<uint32_t> pos_id(vertices.size());
+    {
+        std::unordered_map<uint64_t, uint32_t> seen;
+        seen.reserve(vertices.size() * 2);
+        for (size_t v = 0; v < vertices.size(); ++v) {
+            uint32_t bx, by, bz;
+            std::memcpy(&bx, &vertices[v].px, 4); std::memcpy(&by, &vertices[v].py, 4); std::memcpy(&bz, &vertices[v].pz, 4);
+            uint64_t k = (uint64_t(bx) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(by) * 0xC2B2AE3D27D4EB4Full) ^ uint64_t(bz);
+            auto it = seen.find(k);
+            if (it != seen.end() && vertices[it->second].px == vertices[v].px && vertices[it->second].py == vertices[v].py &&
+                vertices[it->second].pz == vertices[v].pz)
+                pos_id[v] = pos_id[it->second];
+            else {
+                pos_id[v] = uint32_t(v);
+                if (it == seen.end()) seen.emplace(k, uint32_t(v));
+            }
+        }
+    }
+    uint64_t fins_removed = 0;
+    std::vector<uint32_t> group_tris;
+    std::vector<size_t> group_tri_owner;
+    std::vector<uint8_t> group_drop;
+
     std::vector<clodGroup> groups;
     std::vector<OutCluster> clusters;
     std::vector<uint32_t> out_indices;
@@ -266,16 +364,41 @@ extern "C" VGEO_API int vgeo_build(const vgeo_build_input* in, const char* path_
     clodBuild(config, mesh, [&](clodGroup group, const clodCluster* cl, size_t count) -> int {
         int gid = int(groups.size());
         groups.push_back(group);
+        // fins: within the clusters of each simplification (same refined group); original geometry
+        // (refined < 0) is the source as given and is never touched
+        std::unordered_map<int, std::vector<size_t>> by_refined;
+        for (size_t i = 0; i < count; ++i)
+            if (cl[i].refined >= 0) by_refined[cl[i].refined].push_back(i);
+        std::vector<std::vector<uint32_t>> kept(count);
+        for (size_t i = 0; i < count; ++i) kept[i].assign(cl[i].indices, cl[i].indices + cl[i].index_count);
+        for (auto& kv : by_refined) {
+            group_tris.clear();
+            group_tri_owner.clear();
+            for (size_t i : kv.second)
+                for (size_t t = 0; t < kept[i].size() / 3; ++t) {
+                    group_tris.insert(group_tris.end(), kept[i].begin() + t * 3, kept[i].begin() + t * 3 + 3);
+                    group_tri_owner.push_back(i);
+                }
+            size_t removed = find_fins(group_tris, pos_id, group_drop);
+            if (!removed) continue;
+            fins_removed += removed;
+            for (size_t i : kv.second) kept[i].clear();
+            for (size_t t = 0; t < group_drop.size(); ++t)
+                if (!group_drop[t]) {
+                    std::vector<uint32_t>& dst = kept[group_tri_owner[t]];
+                    dst.insert(dst.end(), group_tris.begin() + t * 3, group_tris.begin() + t * 3 + 3);
+                }
+        }
         for (size_t i = 0; i < count; ++i) {
             OutCluster oc;
             oc.index_offset = uint32_t(out_indices.size());
-            oc.tri_count = uint32_t(cl[i].index_count / 3);
+            oc.tri_count = uint32_t(kept[i].size() / 3);
             oc.group = gid;
             oc.refined = cl[i].refined;
             oc.depth = uint32_t(group.depth);
             std::memcpy(oc.center, cl[i].bounds.center, sizeof(oc.center));
             oc.radius = cl[i].bounds.radius;
-            out_indices.insert(out_indices.end(), cl[i].indices, cl[i].indices + cl[i].index_count);
+            out_indices.insert(out_indices.end(), kept[i].begin(), kept[i].end());
             clusters.push_back(oc);
             emitted_tris += oc.tri_count;
         }

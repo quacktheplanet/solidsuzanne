@@ -1,0 +1,32 @@
+schema_version = "1.0.0"
+
+id = "vgeo"
+version = "0.3.0"
+name = "VGEO Virtualized Geometry"
+tagline = "Nanite-style cluster LOD for EEVEE and Cycles"
+maintainer = "Lucas DeMeritt"
+type = "add-on"
+website = "https://github.com/quacktheplanet/solidsuzanne"
+tags = ["Mesh", "Object", "Render", "Geometry Nodes"]
+
+blender_version_min = "5.1.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Lucas DeMeritt"]
+
+# the native library (bin/vgeo_stream) is built per platform; tools/package_addon.py builds one
+# package per platform it has a library for
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Write .vgeo assets next to the .blend file, and web exports"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.pdb",
+  "*.ilk",
+  "*.exp",
+  "*.lib",
+]

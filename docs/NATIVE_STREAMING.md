@@ -384,5 +384,10 @@ cut selection if needed.
   relations rebuild, ~0.1 s in EEVEE); later reassignments reuse them.
 - Building without a full Blender mesh in memory (import straight from
   disk, or tiled builds), for sources beyond what Blender can hold.
-- Rare back-to-back "fins" left by simplification (about 3 per 100k
-  triangles at coarse levels) are harmless but could be filtered.
+- Back-to-back "fins" (two triangles on the same three positions, opposite
+  winding) left by simplification are removed when an asset is built: free
+  fins entirely, fins that plug a hole down to the side that agrees with its
+  neighbours. They rendered as dark specks in Cycles (0.2-4 % of the
+  triangles of coarse levels of a flat-shaded sphere); after the fix every
+  level is watertight and under 0.1 % remain (fins whose edges disagree, left
+  alone). Assets built before keep theirs until re-virtualized.

@@ -1025,6 +1025,30 @@ def run():
     bpy.data.collections.remove(dcol)
     bpy.data.objects.remove(pdup)
 
+    # ---- no fins: simplification must not leave back-to-back triangles (dark specks in Cycles)
+    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=6, radius=1.0, location=(500, 0, 0))
+    flat = bpy.context.object          # flat shaded: every vertex split by normals, the worst case
+    rc = bpy.ops.vgeo.virtualize()
+    fproxy = bpy.context.active_object
+    fa = native.Asset(stream.asset_path(fproxy))
+    worst, open_worst, share = 0, 0, 0.0
+    for depth in range(fa.info["lod_levels"]):
+        d = fa.level_mesh_data(depth)
+        if d is None:
+            continue
+        pos, tri = d["positions"].reshape(-1, 3), d["corner_verts"].reshape(-1, 3)
+        _, weld = np.unique(np.round(pos, 6), axis=0, return_inverse=True)
+        t = weld.ravel()[tri]
+        key = np.sort(t, axis=1)
+        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        worst = max(worst, int((cnt[inv.ravel()] > 1).sum()))
+        share = max(share, (cnt[inv.ravel()] > 1).mean())
+        open_worst = max(open_worst, open_edges(pos, tri))
+    fa.close()
+    # (a fin whose edges disagree with its neighbours stays: removing either side would open an edge)
+    check("fins removed (< 0.1 % left), every level watertight", rc == {'FINISHED'} and share < 0.001
+          and open_worst == 0, f"{worst} triangles in shared triples ({share:.3%}), {open_worst} open edges")
+
     # ---- a moved project: Find Missing Assets relinks the .vgeo by file name
     import shutil
     moved = os.path.join(OUT, "moved_assets", "deep")

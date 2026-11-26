@@ -52,3 +52,9 @@ build-*/
 *.vgeo.part
 *.vgeow.part
 web/assets/
+
+# extension packaging (tools/package_addon.py)
+dist/
+build-package/
+build-dev/
+build-fresh/
