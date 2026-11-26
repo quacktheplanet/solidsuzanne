@@ -207,7 +207,7 @@ default; branch `phase2-atoms`):
 - [x] Atom libraries are not saved in the .blend; refilled from the .vgeo after
       opening (statue avenue: 162 MB file instead of 320 MB).
 - [ ] Proxies as single-copy instancers; retire chunk meshes and streamed copies
-      (owner's go given November 2026).
+      (not decided yet).
 
 T1, triangles drawn (`tools/instancing_bench.py`, 1280x720, the bench's error):
 
