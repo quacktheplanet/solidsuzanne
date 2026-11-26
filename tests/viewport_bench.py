@@ -1,6 +1,12 @@
 """Interactive viewport benchmark (needs the Blender UI, not -b).
 
     blender path/to/scene.blend --python tests/viewport_bench.py -- --out DIR [--seconds 10]
+        [--motion fly|orbit|path] [--cameras cams.json] [--offscreen COARSEN|SHADOWS|CULL] [--slots N]
+        [--phases solid_frozen,solid_stream,eevee_frozen,eevee_stream]
+
+--cameras (implies --motion path) flies through the cameras of a cams.json ({"pos", "target", "fov"})
+over --seconds, the way tools/instancing_bench.py places them. --offscreen and --slots set every
+instancer's Off-screen mode and Streamed Copies first.
 
 Flies the 3D viewport from the scene camera forward while the VGEO live loop
 streams, once in Solid and once in Material Preview (EEVEE). Records real
@@ -27,10 +33,18 @@ SECONDS = float(argv[argv.index("--seconds") + 1]) if "--seconds" in argv else 1
 SPEED = float(argv[argv.index("--speed") + 1]) if "--speed" in argv else 25.0
 os.makedirs(OUT, exist_ok=True)
 
+CAMS = None
+if "--cameras" in argv:
+    with open(argv[argv.index("--cameras") + 1]) as _f:
+        CAMS = json.load(_f)
+
 state = {"frames": [], "phase": None, "t0": 0.0, "report": {}, "updates0": 0, "tick_s": 0.0, "ticks": 0}
 # (shading, label, freeze): frozen phases draw the same geometry without streaming = baseline
 PHASES = [("SOLID", "solid_frozen", True), ("SOLID", "solid_stream", False),
           ("MATERIAL", "eevee_frozen", True), ("MATERIAL", "eevee_stream", False)]
+if "--phases" in argv:
+    _want = argv[argv.index("--phases") + 1].split(",")
+    PHASES = [p for p in PHASES if p[1] in _want]
 
 
 _dg = {"n": 0, "ids": {}}
@@ -53,8 +67,18 @@ def timed_tick():
 
 
 def set_freeze(on):
+    from vgeo import instances
     for o in stream.proxies():
-        o.vgeo.freeze = on
+        if not o.vgeo.slot_of:   # streamed copies follow their instancer
+            o.vgeo.freeze = on
+    for o in instances.instancers():
+        o.vgeo_inst.freeze = on
+
+
+def instancer_stats():
+    from vgeo import instances
+    return {o.name: {"shown_triangles": o.vgeo_inst.shown_triangles, "offscreen": getattr(o.vgeo_inst, "offscreen", "COARSEN"),
+                     "copies": len(o.data.vertices)} for o in instances.instancers()}
 
 
 def view3d():
@@ -76,11 +100,34 @@ def _draw():
             rt.swap_dg_ms = None
 
 
-MOTION = argv[argv.index("--motion") + 1] if "--motion" in argv else "fly"
+MOTION = argv[argv.index("--motion") + 1] if "--motion" in argv else ("path" if CAMS else "fly")
+
+
+def path_matrix(t):
+    """Camera-to-world matrix and horizontal FOV along the cameras of --cameras, t in [0, 1]."""
+    n = len(CAMS)
+    x = min(max(t, 0.0), 1.0) * (n - 1)
+    k = min(int(x), n - 2) if n > 1 else 0
+    f = x - k if n > 1 else 0.0
+    a, b = CAMS[k], CAMS[min(k + 1, n - 1)]
+    pos = Vector(a["pos"]).lerp(Vector(b["pos"]), f)
+    qa = (Vector(a["target"]) - Vector(a["pos"])).to_track_quat('-Z', 'Y')
+    qb = (Vector(b["target"]) - Vector(b["pos"])).to_track_quat('-Z', 'Y')
+    fov = a.get("fov", 50) * (1 - f) + b.get("fov", 50) * f
+    return Matrix.Translation(pos) @ qa.slerp(qb, f).to_matrix().to_4x4(), fov
 
 
 def set_view(space, t):
     """fly: scene camera moving forward and yawing. orbit: circling a point ahead of the camera."""
+    if MOTION == "path":
+        import math
+        m, fov = path_matrix(t / SECONDS)
+        rv3d = space.region_3d
+        rv3d.view_perspective = 'PERSP'
+        rv3d.view_matrix = m.inverted()
+        # the viewport frames lenses on a 72 mm sensor (36 mm with zoom 2), fitted to the wider side
+        space.lens = 36.0 / math.tan(math.radians(fov) * 0.5)
+        return
     cam = bpy.context.scene.camera
     m = cam.matrix_world.copy()
     if MOTION == "orbit":
@@ -172,6 +219,8 @@ def tick():
         "swap_depsgraph_ms": state.get("swap_dg", [])[:12],
         "swap_tris": [getattr(stream._runtimes.get(o.vgeo.uid), "swap_tris", 0) for o in stream.proxies()],
         "proxies": stats,
+        "instancers": instancer_stats(),
+        "region": [region.width, region.height],
     }
     state["report"][label] = rep
     print("VIEWPORT", label, json.dumps(rep), flush=True)
@@ -204,6 +253,13 @@ def begin_phase(space):
 
 def start():
     vgeo.register()
+    from vgeo import instances
+    for o in instances.instancers():
+        if "--offscreen" in argv:
+            if hasattr(o.vgeo_inst, "offscreen"):
+                o.vgeo_inst.offscreen = argv[argv.index("--offscreen") + 1]
+        if "--slots" in argv:
+            o.vgeo_inst.stream_slots = int(argv[argv.index("--slots") + 1])
     stream.DIAG_SWAP = "--diag" in argv
     # time the live loop: swap its timer for a timed wrapper
     if bpy.app.timers.is_registered(stream._tick):

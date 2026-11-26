@@ -5,127 +5,91 @@
 <h1 align="center">VGEO — Virtualized Geometry for Blender</h1>
 
 <p align="center">
-  Nanite-style meshlet rendering in the Blender viewport, built on Vulkan.
+  Nanite-style cluster LOD for Blender's own renderers: billions of triangles in the viewport, EEVEE and Cycles.
 </p>
 
 ---
 
-## New: native streaming (EEVEE + Cycles)
+VGEO turns dense meshes into a Nanite-style cluster hierarchy (built with
+meshoptimizer's clusterlod into a memory-mapped `.vgeo` file) and hands Blender
+only the crack-free, view-dependent cut each view needs, as ordinary meshes and
+instances. EEVEE and Cycles render it with full materials, lights and shadows.
+Nothing else does this for Blender's own renderers: other virtual geometry lives
+inside its own engine.
 
-`addons/vgeo` + `src/stream` virtualize the geometry instead of replacing
-Blender's renderer: a Nanite-style cluster DAG (built with meshoptimizer's
-clusterlod) stays on disk, and only the view-dependent, crack-free cut is
-streamed into ordinary meshes, so EEVEE and Cycles render it with full
-materials, lights and shadows. A 33.5M-triangle terrain streams at ~28 fps
-while moving and renders in Cycles from a cut of a few million triangles.
-See [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
+- **Virtualize Mesh**: one object streams its cut into mesh chunks (a 33.5M
+  triangle terrain streams at ~28 fps while moving).
+- **Scatter Instances / Virtualize Instances**: thousands of copies of an asset,
+  scattered by VGEO or taken over from your own Geometry Nodes, particle or
+  collection-instance scatter. Each copy gets its own level of detail.
+- **Meshlet Instancing** (experimental): every copy drawn as its own meshlet cut,
+  built from instanced pieces of the asset that never change. On the 4.36-billion
+  triangle statue avenue it draws within 6 % of a per-copy meshlet cut (the rule
+  the browser viewers use) and flies at 50 fps in EEVEE, 86 fps in Solid (1280x800
+  window, RTX A4500), against 13 and 16 fps for whole-copy levels.
+- **Off-screen modes**: copies outside the view coarsened, culled, or kept only
+  while their shadow can reach it.
+- **Debug views**: Meshlets, LOD and Triangles, plus a stats overlay.
+- **Web export**: the same assets in a WebGPU viewer (`web/`), paged over HTTP
+  range requests.
 
-The sections below describe the original Vulkan proof of concept.
+How it works and every measurement: [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
+Where it is going: [docs/ROADMAP.md](docs/ROADMAP.md).
 
----
+## Install
 
-## What it does
+Download `vgeo-<version>.zip` from the releases, then in Blender 5.1 or newer:
+**Edit > Preferences > Get Extensions > (menu) Install from Disk**. Windows for now;
+macOS and Linux builds are on the roadmap.
 
-VGEO converts meshes into a compact meshlet format and renders them live inside Blender's viewport using a headless Vulkan renderer. The current proof-of-concept renders full meshlet color debug visualization — each cluster gets a unique color, matching the kind of view Unreal's Nanite debug mode shows.
+Save your .blend, select a dense mesh and run **Object > Virtualize Mesh**. Then:
 
-<p align="center">
-  <img src="docs/images/meshletsTEST.png" width="720" alt="Meshlet colorization in Blender viewport with N-panel"/>
-</p>
+- **Scatter Instances** (the VGEO sidebar tab) scatters copies over another selected mesh, or
+  **Object > Virtualize Instances** takes over an existing Geometry Nodes, particle or
+  collection-instance scatter of a virtualized mesh.
+- The **VGEO** sidebar tab has the error budgets, Off-screen modes, the debug views and the stats
+  overlay.
 
-*Meshlet color debug view with the VGEO N-panel. Blender render engine set to VGEO.*
+Assets are written to a `vgeo` folder next to the .blend; keep it with the file (if it goes
+missing, the panel's **Find Missing Assets** relinks it).
 
----
-
-## Current state
-
-- Convert any Blender mesh to `.vgeo` with one button
-- Live viewport rendering via headless Vulkan → pixel readback → Blender GPU texture
-- Meshlet color debug mode (toggle in the N-panel)
-- Camera orbit, pan, and zoom tracked from Blender's viewport
-- Proxy object transform tracked — move/rotate the proxy and the render follows
-- Scene stats panel showing meshlet and cluster counts
-
----
-
-## How to use
-
-### Build
-
-```
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
-```
-
-Requires Vulkan SDK, CMake 3.20+, and a C++20 compiler. Builds `vgeo_build.exe` and `vgeo_native.pyd` (Python extension for Blender).
-
-### Install the addon
-
-1. In Blender: **Preferences → File Paths → Scripts** — point it to the repo root (`NewRepo/`)
-2. **Preferences → Add-ons** — search for "VGEO" and enable it
-3. Copy `build/src/python/Release/vgeo_native.pyd` next to the addon's `__init__.py`
-
-### Convert and view
-
-1. Select a mesh in Blender
-2. Open the **N-panel → VGEO → Convert Active Mesh → VGEO**
-3. Save the `.vgeo` file anywhere
-4. Switch the render engine to **VGEO** (Properties → Render → Render Engine)
-5. Toggle **Meshlet Colors** in the N-panel to see cluster visualization
-
----
-
-## Architecture
+## Build from source
 
 ```
-Blender mesh
-    │
-    ▼
-vgeo_build.exe        ← meshlet generation via meshoptimizer
-    │
-    ▼
-.vgeo file            ← compact binary: meshlets + cluster BVH + indices
-    │
-    ▼
-vgeo_native.pyd       ← pybind11 C++ extension loaded by Blender
-    │
-    ▼
-VGEORenderEngine      ← Blender RenderEngine subclass
-    │
-    ├── vgeo_native.Scene    — scene graph, object transforms
-    ├── vgeo_native.Camera   — synced from Blender viewport each frame
-    └── vgeo_native.Renderer — headless Vulkan renderer
-            │
-            └── pixel readback → gpu.texture → draw_texture_2d
+cmake -S . -B build-stream -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-stream
+python tools/package_addon.py          # -> dist/vgeo-<version>.zip (Blender's extension build + validate)
 ```
 
----
+Needs CMake 3.20+ and a C++20 compiler (meshoptimizer is fetched at a pinned commit); the native
+library lands in `addons/vgeo/bin/`, so `addons/vgeo` also works as a development add-on.
 
-## Project structure
+Tests and benchmarks (Blender 5.1):
 
 ```
-addons/vgeo_blender/     Blender addon (engine, operators, panels)
-src/
-  core/                  Camera, scene graph, math utilities
-  preprocess/            Mesh → .vgeo converter (meshlet builder)
-  runtime/               Headless Vulkan offscreen renderer
-  python/                pybind11 bindings
-tools/vgeo_build/        CLI converter tool
-src/runtime/shaders/     GLSL shaders (compiled to SPIR-V at build time)
-spec/                    Format specifications
+blender -b --factory-startup --python tests/test_stream.py
+blender -b --factory-startup --python examples/statue_avenue/build_scene.py -- OUT
+blender -b OUT/statue_avenue.blend --python tools/instancing_bench.py -- --cameras examples/statue_avenue/cameras.json --error 1.5 --offscreen SHADOWS,CULL
 ```
-
----
-
-## Requirements
-
-- GPU with Vulkan 1.3+
-- Windows 10+ (Linux/macOS via MoltenVK untested)
-- Blender 4.0+
-- CMake 3.20+, C++20 compiler, Vulkan SDK
 
 ---
 
 ## Acknowledgments
 
 Built on insights from Epic Games' Nanite, [meshoptimizer](https://github.com/zeux/meshoptimizer) by Arseny Kapoulkine, and NVIDIA mesh shader research.
+
+---
+
+## License
+
+VGEO is free and open source software under the [GNU General Public License
+v3.0 or later](LICENSE), the GPL like Blender itself: use it for anything,
+commercial work included; if you distribute a modified version, share its source
+under the same terms. Third-party components are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Support development
+
+VGEO is built in spare time. If it is useful to you, you can
+[sponsor it on GitHub](https://github.com/sponsors/quacktheplanet); donations decide
+what comes next on the [roadmap](docs/ROADMAP.md), such as macOS and Linux builds.

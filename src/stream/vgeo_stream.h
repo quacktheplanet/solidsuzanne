@@ -122,7 +122,7 @@ typedef struct vgeo_chunk_data {
     const float* uvs;             // vertex_count * 2 (NULL if absent)
     const int32_t* corner_verts;  // tri_count * 3
     const int32_t* face_materials;// tri_count
-    const int32_t* face_lod;      // tri_count, DAG depth (for debug views)
+    const int32_t* face_lod;      // tri_count, (cluster << 6) | DAG depth (for debug views)
     // Blender-style edges: unique vertex pairs, and per corner the edge from
     // that corner to the next corner of its triangle
     uint32_t edge_count;
@@ -179,6 +179,94 @@ VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uint64_t* out_
 // range requests as the view needs them. Returns 0 on success.
 VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf8, uint32_t page_vertices,
                                    uint64_t* out_bytes, char* err, int err_len);
+
+// ---------------------------------------------------------------- cut atoms and many copies
+
+// An atom is the set of clusters sharing a (group, refined) pair. The cut rule tests only those
+// two groups, so an atom is always in or out of the cut as a whole: a fixed piece of the asset at
+// a fixed detail. Copies of an asset can be drawn as instances of atom meshes that never change.
+typedef struct vgeo_atom {
+    int32_t group;                // group its clusters belong to
+    int32_t refined;              // group they were simplified from, -1 = original geometry
+    uint32_t cluster_offset;      // into vgeo_atom_clusters
+    uint32_t cluster_count;
+    uint32_t tri_count;
+    uint32_t depth;               // DAG depth of `group`
+    float center[3];              // bounds enclosing its clusters' bounds
+    float radius;
+} vgeo_atom;
+
+// Number of atoms; writes min(max_atoms, count) atoms to out (out may be NULL).
+VGEO_API int vgeo_atoms(void* handle, vgeo_atom* out, int max_atoms);
+
+// Blocks: the atoms simplified from one parent group (two or more of them), drawn as one piece when
+// all are in a copy's cut (fewer instances, same triangles). group = -1, refined = the parent group,
+// cluster_offset / cluster_count index the block's atoms. Unit ids: atoms 0..A-1, then blocks A..A+B-1.
+VGEO_API int vgeo_blocks(void* handle, vgeo_atom* out, int max_blocks);
+
+// Extract one unit (an atom, or a block for ids >= the atom count) as an indexed mesh (same layout as
+// vgeo_extract; valid until the next extract).
+VGEO_API int vgeo_extract_atom(void* handle, uint32_t unit, vgeo_chunk_data* out);
+
+// Lights that let copies outside the view stay, because their shadow can reach it (Shadows mode).
+typedef struct vgeo_shadow_light {
+    int32_t kind;                 // 0 = sun (dir), 1 = point or spot (pos, range, axis, cos_half)
+    float dir[3];                 // sun: unit direction its light travels
+    float reach;                  // sun: how far a shadow reaches along dir; <= 0 = 2 r / max(-dir.z, 0.1)
+    float pos[3];
+    float range;
+    float axis[3];                // spot axis (unit); ignored when half_angle >= pi/2
+    float half_angle;             // pi for point lights
+} vgeo_shadow_light;
+
+enum { VGEO_OFFSCREEN_FULL = 0, VGEO_OFFSCREEN_COARSEN = 1, VGEO_OFFSCREEN_CULL = 2,
+       VGEO_OFFSCREEN_SHADOWS = 3 };
+enum { VGEO_SELECT_BLOCKS = 1 };   // flags: emit blocks (unit ids >= atom count) where all their atoms are in
+
+typedef struct vgeo_instances_stats {
+    uint64_t triangles;           // over every pair written
+    uint32_t pairs;               // pairs needed (may exceed max_pairs: then nothing past it is written)
+    uint32_t copies_drawn;        // copies with at least one atom
+} vgeo_instances_stats;
+
+// Select the cut of every copy of the asset in one call and return (copy, atom) pairs, copy-major.
+// views are in WORLD space (camera, planes) with the asset's units (threshold as in vgeo_view;
+// frustum_mode and offscreen_scale of the views are ignored: `mode` and `offscreen_scale` apply).
+// transforms: n * 12 floats, row-major 3x4 local-to-world matrices; scales: n uniform scales
+// (how the matrix scales lengths; errors and radii are multiplied by it). copy_mask (n bytes, or
+// NULL) skips copies whose byte is 0. Modes: FULL ignores the frustum; COARSEN uses
+// threshold * offscreen_scale for groups outside every view; CULL drops atoms outside every view;
+// SHADOWS is CULL, except atoms whose shadow from `lights` can reach a view are kept (coarsened).
+VGEO_API int vgeo_select_instances(void* handle, const vgeo_view* views, int view_count,
+                                   const float* transforms, const float* scales, const uint8_t* copy_mask,
+                                   int copy_count, int mode, float offscreen_scale,
+                                   const vgeo_shadow_light* lights, int light_count, const void* occlusion,
+                                   int flags, uint32_t* out_pairs, uint32_t max_pairs,
+                                   vgeo_instances_stats* stats);
+
+// ---------------------------------------------------------------- occlusion culling
+//
+// A small CPU depth buffer of coarse occluders (the nearest copies' uniform levels, pushed away from
+// the camera by their simplification error and eroded by a pixel, so it never claims more than the
+// real surfaces hide) and a max-depth pyramid. Passed to vgeo_select_instances (single view only):
+// hidden copies are dropped in Cull, coarsened in Coarsen, and in Shadows kept (coarsened) while their
+// sun shadow volume or a lamp in range may still show; hidden atoms are dropped in Cull and Shadows.
+VGEO_API void* vgeo_occlusion_new(int width, int height);
+VGEO_API void vgeo_occlusion_free(void* occlusion);
+// for experiments: triangles per occluder copy (0 = keep, default 6000), erosion and error push (1/0)
+VGEO_API int vgeo_occlusion_config(void* occlusion, uint64_t copy_triangles, int erode, int push);
+// view_proj: world -> clip, 16 floats row-major; camera: world position; znear: near distance
+VGEO_API int vgeo_occlusion_begin(void* occlusion, const float* view_proj, const float* camera, float znear);
+// Rasterize copies of an asset (nearest first: stops past max_triangles in total, 0 = no limit), each at
+// the coarsest level within pixel_error pixels of the buffer (at most a few thousand triangles a copy).
+VGEO_API int vgeo_occlusion_add(void* occlusion, void* handle, const float* transforms, const float* scales,
+                                int count, float pixel_error, uint64_t max_triangles, uint64_t* out_triangles);
+VGEO_API int vgeo_occlusion_finish(void* occlusion);
+// 1 per sphere hidden behind the occluders (after finish)
+VGEO_API int vgeo_occlusion_test(void* occlusion, const float* centers, const float* radii, int count,
+                                 uint8_t* out_occluded);
+// the eroded depth buffer (width * height floats, view distance, FLT_MAX = empty), for debugging
+VGEO_API int vgeo_occlusion_depth(void* occlusion, float* out);
 
 VGEO_API int vgeo_version(void);
 

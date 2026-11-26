@@ -545,10 +545,12 @@ def fill_mesh(me, data, materials, lod_colors):
     if len(materials) > 1:
         _set_attr(me, "material_index", 'INT', 'FACE', "value", data["face_materials"])
     if lod_colors:
-        lod = np.repeat(data["face_lod"] % len(LOD_PALETTE), 3)
+        lod = np.repeat((data["face_lod"] & 63) % len(LOD_PALETTE), 3)
         col = _set_attr(me, "vgeo_lod", 'FLOAT_COLOR', 'CORNER', "color",
                         np.ascontiguousarray(LOD_PALETTE[lod]).ravel())
         me.color_attributes.active_color = col
+    from . import debug
+    debug.write_viz(me, data)
     me.update()
 
 
@@ -813,9 +815,18 @@ def update_for_render(scene, depsgraph=None):
     if view is None:
         return
     from . import instances
+    fix_duplicates()
     # instancers first: they choose which copies get a streamed cut and make it now
-    for inst in instances.instancers(scene):
-        if not inst.hide_render:
+    with instances.tick_scope():
+        for inst in instances.instancers(scene):
+            if inst.vgeo_inst.atoms is not None and inst.library is None:
+                instances.sync_cloud_visibility(inst)
+        insts = [i for i in instances.instancers(scene) if not i.hide_render
+                 and i.library is None and i.data.library is None]
+        vl_objects = bpy.context.view_layer.objects if bpy.context.view_layer else None
+        occluders = [i for i in insts if vl_objects is None or i.name in vl_objects]
+        instances.prepare_occlusion(occluders, [view])
+        for inst in insts:
             instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
     for obj in proxies(scene):
         if obj.vgeo.collection is not None:
@@ -845,8 +856,52 @@ def _orphan_check():
     return True
 
 
+_dup_sig = None
+
+
+def fix_duplicates():
+    """Duplicating a proxy or an instancer copies its ID. The object that owns the children (chunks,
+    atom clouds, streamed copies) keeps it; each copy gets a new ID and makes children of its own."""
+    global _dup_sig
+    from . import instances
+    objs = [o for o in bpy.data.objects if o.library is None and (o.vgeo.uid or o.vgeo_inst.uid)]
+    sig = (len(bpy.data.objects), tuple(sorted((o.name, o.vgeo.uid, o.vgeo_inst.uid) for o in objs)))
+    if sig == _dup_sig:
+        return 0
+    fixed = 0
+    groups = {}
+    for o in objs:
+        if o.vgeo.uid and not o.vgeo.slot_of:
+            groups.setdefault(("p", o.vgeo.uid), []).append(o)
+        if o.vgeo_inst.uid:
+            groups.setdefault(("i", o.vgeo_inst.uid), []).append(o)
+    for (kind, _uid), group in groups.items():
+        if len(group) < 2:
+            continue
+        def owns(o):
+            if kind == "p":
+                col = o.vgeo.collection
+                return col is not None and any(c.parent == o for c in col.objects)
+            return any(c.parent == o for c in o.children)
+        group.sort(key=lambda o: (not owns(o), len(o.name), o.name))
+        for o in group[1:]:
+            if kind == "p":
+                o.vgeo.uid = new_uid()
+                o.vgeo.collection = None          # chunks of its own, made on its first cut
+            else:
+                o.vgeo_inst.uid = new_uid()
+                me = o.data
+                if me.users > 1:                  # a linked duplicate shares the placements: give it its own
+                    o.data = me.copy()
+                instances._write_streamed(o, np.zeros(len(o.data.vertices), bool))
+            fixed += 1
+    _dup_sig = sig if not fixed else None
+    return fixed
+
+
 def _housekeeping(objs, vl):
     """Selection, visibility and collection links of the chunks follow the proxy."""
+    fix_duplicates()
     redirect_selection(vl)
     for obj in proxies():
         if obj.vgeo.collection is not None:
@@ -866,8 +921,14 @@ def _tick():
         from . import instances
         # idle streamed copies (slot_index < 0) belong to an instancer and show nothing
         objs = [o for o in proxies() if not o.vgeo.freeze and not (o.vgeo.slot_of and o.vgeo.slot_index < 0)]
-        insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
+        for inst in instances.instancers():
+            if inst.vgeo_inst.atoms is not None:
+                instances.sync_cloud_visibility(inst, bpy.context.view_layer)
+        # linked from another file: their placements cannot be written, so they show what was saved
+        insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze
+                 and o.library is None and o.data.library is None]
         if not objs and not insts:
+            fix_duplicates()
             _orphan_check()  # a deleted proxy's chunks must not linger
             return 0.5
         vl = bpy.context.view_layer
@@ -875,12 +936,16 @@ def _tick():
         views = viewport_views()
         if not views:
             return 0.25
-        for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
-            try:
-                if vl is None or inst.visible_get(view_layer=vl):
-                    instances.update(inst, views, inst.vgeo_inst.pixel_error)
-            except RuntimeError:
-                continue
+        with instances.tick_scope():
+            if any(getattr(i.vgeo_inst, "use_atoms", False) and getattr(i.vgeo_inst, "use_occlusion", False)
+                   for i in insts):
+                instances.prepare_occlusion([i for i in insts if vl is None or i.visible_get(view_layer=vl)], views)
+            for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
+                try:
+                    if vl is None or inst.visible_get(view_layer=vl):
+                        instances.update(inst, views, inst.vgeo_inst.pixel_error, paced=True)
+                except RuntimeError:
+                    continue
         if not objs:
             return TICK
         visible = []
@@ -933,6 +998,20 @@ def _on_render_pre(scene, depsgraph=None):
 
 
 @persistent
+def _on_frame_change_post(scene, depsgraph=None):
+    # Animation renders: render_pre reads the camera from the view layer's depsgraph, which
+    # the render pipeline does not move to the new frame, so the cut could stay on an old
+    # frame's camera for the rest of the render. After a frame change the handler gets the
+    # render's own depsgraph, evaluated at the frame about to be rendered: cut from that.
+    if not _rendering:
+        return
+    try:
+        update_for_render(scene, depsgraph)
+    except Exception as e:
+        print("VGEO render cut failed:", e)
+
+
+@persistent
 def _on_render_done(scene, depsgraph=None):
     global _rendering
     _rendering = False
@@ -942,10 +1021,17 @@ def _on_render_done(scene, depsgraph=None):
 @persistent
 def _on_load(_a=None, _b=None):
     invalidate_all(close=True)
+    from . import debug
+    debug.mode = getattr(bpy.context.scene, "vgeo_debug", 'NONE') if bpy.context.scene else 'NONE'
+
+    from . import instances
+    instances.close_atom_assets()
 
 
 @persistent
 def _on_save(_a=None, _b=None):
+    from . import instances
+    instances.detach_libraries()   # atom libraries are rebuilt from the .vgeo after opening
     # hidden backs would double the saved geometry; only the shown cut goes into the file
     for obj in proxies():
         rt = _runtimes.get(obj.vgeo.uid)
@@ -957,8 +1043,16 @@ def _on_save(_a=None, _b=None):
 
 
 @persistent
+def _on_save_post(_a=None, _b=None):
+    from . import instances
+    instances.attach_libraries()
+
+
+@persistent
 def _on_undo(_a=None, _b=None):
     invalidate_all()
+    from . import instances
+    instances.reset_atom_state()
 
 
 def new_uid():
@@ -968,8 +1062,9 @@ def new_uid():
 def register():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
-                    (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save), (h.save_post, _on_save_post),
+                    (h.undo_post, _on_undo), (h.redo_post, _on_undo),
+                    (h.frame_change_post, _on_frame_change_post)):
         if fn not in lst:
             lst.append(fn)
     if not bpy.app.timers.is_registered(_tick):
@@ -979,10 +1074,13 @@ def register():
 def unregister():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
-                    (h.undo_post, _on_undo), (h.redo_post, _on_undo)):
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save), (h.save_post, _on_save_post),
+                    (h.undo_post, _on_undo), (h.redo_post, _on_undo),
+                    (h.frame_change_post, _on_frame_change_post)):
         while fn in lst:
             lst.remove(fn)
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     invalidate_all(close=True)
+    from . import instances
+    instances.close_atom_assets()

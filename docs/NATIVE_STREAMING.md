@@ -1,8 +1,8 @@
 # Native streaming: virtualized geometry rendered by EEVEE and Cycles
 
-The original VGEO path renders meshlets with its own headless Vulkan
-renderer and copies the pixels into the viewport. That can never look like
-EEVEE or reach Cycles, because it replaces Blender's renderers instead of
+VGEO started as a headless Vulkan meshlet renderer whose pixels were copied
+into the viewport (removed in November 2026). That could never look like
+EEVEE or reach Cycles, because it replaced Blender's renderers instead of
 feeding them.
 
 The native streaming path keeps Blender's renderers and virtualizes the
@@ -164,22 +164,139 @@ boulder = 2.6 billion source triangles.
 | Viewport while flying | Solid ~117 fps, EEVEE ~68-79 fps, worst frame 42-45 ms |
 
 **Streamed copies.** A whole-asset level wastes triangles on a copy seen up
-close: level 0 is the entire asset at full detail, though most of it is far
-away or facing away. Copies that want level 0 (nearest first, up to
-**Streamed Copies**, default 4, only for assets whose level 0 is at least
-20k triangles) are shown by a streamed copy instead: a VGEO proxy parented
+close: its level must be fine enough for the copy's nearest point, so the rest
+of it (far away or facing away) is drawn at that detail too. The copies whose
+level meshes cost the most triangles, at any level (up to **Streamed Copies**,
+default 8, and only copies whose level mesh is at least 20k triangles), are
+shown by a streamed copy instead: a VGEO proxy parented
 to the instancer, placed like the copy, hidden from selection, streaming a
-view-dependent cut through the same live loop. It starts empty; the copy
+view-dependent cut through the same live loop. A copy that holds a streamed
+copy keeps it until another costs 1.5x more, so slots do not flip back and
+forth as the view moves. It starts empty; the copy
 keeps its instance until the streamed cut has landed, then the instance is
 dropped (a `vgeo_streamed` point attribute feeds Instance on Points'
 Selection) in the same tick, so there is never a gap or a doubled surface.
 Walking away hands the copy back and empties the streamed copy. Final
 renders make the streamed cuts synchronously.
 
+**Off-screen copies.** The instancer's **Off-screen** setting decides what
+happens to copies outside the view (in the viewport and in final renders):
+
+- **Coarsen**: kept, with the error multiplied by **Off-screen Error** (8),
+  so they still cast shadows and show in reflections. Instancers saved before
+  November 2026 keep this mode (it is the property's default).
+- **Shadows** (what new instancers get): dropped, unless they can shadow what
+  the view shows. For each sun, the test sweeps the copy's bounding sphere
+  along the sun's light by **Shadow Reach** (0 = estimated from the copy's
+  size and the sun's height) and keeps it unless the swept sphere lies fully
+  outside one frustum plane. A point or spot lamp keeps the copies within its
+  reach (its custom distance, else EEVEE's influence radius from the scene's
+  light threshold; a spot also tests its cone), provided its light reaches the
+  view at all. Reflections of dropped copies are lost.
+- **Cull**: every copy outside the view is dropped.
+
+The lamps are scanned once per live tick or render update (`instances.tick_scope`),
+not once per instancer.
+
+Dropped copies get level -1, which the Instance on Points selection leaves
+out (`vgeo_level >= 0`, added in place to node groups from older files).
+
+![Off-screen modes](images/offscreen_modes.jpg)
+
+*Looking away from a low sun: Coarsen (1.23M triangles), Shadows (947k,
+pixel-identical) and Cull (891k, the long shadows of statues behind the camera
+are gone).*
+
+Measuring it: `tools/instancing_bench.py` reports, per camera and instancer,
+what the add-on draws against a meshlet cut on every copy (with and without
+off-screen copies). On the 4.36-billion-triangle statue scene from the Blender
+demo film (1,704 statues of 1.43M triangles, 1,188 floor patches of 1.62M,
+1280x720, 1.5 px, mean of 8 film cameras):
+
+| | Triangles drawn |
+|---|---|
+| Before (level-0 copies only get streamed copies, 6+8 of them) | 2.77M |
+| Heaviest copies streamed, 8 per instancer, Coarsen | 1.78M |
+| Same, Shadows | 1.57M |
+| Same, Cull | 1.51M |
+| Meshlet cut on every copy, off-screen coarsened (ideal, Coarsen) | 1.67M |
+| Meshlet cut on every copy, off-screen skipped (ideal, Cull) | 1.24M |
+
 Scatter demo, viewport 1.8 radii from a boulder (`tests/slot_gui_check.py`):
 the boulder's streamed cut is 353k triangles instead of 1.31M for level 0,
 and it takes over 0.85-0.95 s after the view arrives (5.0.1 and 5.1.2,
 Solid and EEVEE).
+
+## Meshlet Instancing
+
+Whole-copy levels draw a copy at the detail its nearest point needs, so they
+cost about twice a meshlet cut, and streamed copies only help a few heavy
+copies. **Meshlet Instancing** (an instancer option, on for instancers made
+by Scatter or Virtualize Instances; instancers in older files keep what they
+had) gives every copy its own meshlet cut, built from pieces that never change:
+
+- **Atoms.** The clusters sharing a (group, refined) pair are always in or out
+  of the cut together, so each such set is a fixed piece of the asset at a
+  fixed detail. `vgeo_select_instances` selects the cut of every copy in one
+  native call (Off-screen modes per atom, multithreaded over copies) and
+  returns (copy, atom) pairs: 2-7 ms for 1,700 copies.
+- **Blocks** (off by default, `VGEO_BLOCKS=1`). The atoms simplified from one
+  parent group can be drawn as one piece when all of them made a copy's cut:
+  same triangles, 17-44 % fewer instances, but one more copy of the DAG's
+  geometry in Blender (+0.64 GB on the statue avenue) for an fps gain within
+  measuring noise.
+- **Libraries, not objects.** Each slice of 512 atoms and blocks is one mesh
+  (the piece's index as a face attribute) on a library object whose Split to
+  Instances runs once. Thousands of atom objects would cost every depsgraph
+  update ~95 ms; libraries cost nothing until read.
+- **Point clouds.** Each slice has a point cloud parented to the instancer:
+  one point per pair (the copy's placement, the piece's index), instanced by
+  Object Info + Instance on Points (Pick Instance). An update rewrites only
+  the clouds whose pairs changed, and clouds keep spare points (index -1) so
+  most writes keep their size. A full cut change on the statue avenue costs
+  ~10 ms of depsgraph time.
+- **Viewport pacing.** While the view moves, a new cut lands at most every
+  0.2 s, and at once when the view stops. EEVEE pays ~2 us per instance per
+  frame, so the viewport keeps each instancer under 8,000 instances: copies
+  start as one whole level mesh and switch to their atoms in order of
+  triangles saved per extra instance, when each saves at least 1,000. Final
+  renders always draw the full atom cut.
+- **Visibility** of the clouds follows the instancer; a deleted instancer's
+  clouds leave the scene.
+- **Not saved.** The libraries are derived from the `.vgeo`, so saving swaps
+  in an empty mesh for each (the .blend stays the size it would be without
+  them: 162 MB for the statue avenue instead of 320 MB) and the first update
+  after opening refills them (about 2 s for the avenue).
+
+Measured against today's path (`tools/instancing_bench.py`, 1280x720, the
+bench error; `tests/viewport_bench.py --cameras ... --offscreen SHADOWS`,
+flying the film path at a 1280x800 window; RTX A4500):
+
+| | Triangles, Shadows / Cull | Solid flying | EEVEE flying (worst) | EEVEE still |
+|---|---|---|---|---|
+| Statue avenue, today | 1.57M / 1.51M | 16.3 fps | 13.1 fps (210 ms) | 30.5 fps |
+| Statue avenue, meshlet instancing | 1.32M / 1.21M | 86.2 fps | 50.5 fps (66 ms) | 78.8 fps |
+| Synthetic field, today | 14.4M / 14.3M | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
+| Synthetic field, meshlet instancing | 6.06M / 5.92M | 115.3 fps | 73.3 fps (37 ms) | 83.1 fps |
+
+A meshlet cut on every copy with off-screen copies skipped (the browser
+library's rule) draws 1.24M and 5.91M: meshlet instancing is within 6 % of it
+in Shadows mode and at or under it in Cull (whole copies outside the view are
+skipped by the asset's bounds, tighter than the per-cluster spheres).
+
+Memory and final renders (statue avenue, 8 frames along the film path,
+1280x720, 16 samples, `tools/render_memory_bench.py`): the atom libraries hold
+about one more copy of each asset's DAG (6.1M triangles, ~200 bytes each in
+Blender, plus the evaluated split). Peak RSS 3.3 GB (EEVEE) / 3.4 GB (Cycles)
+against 1.7 / 2.2 GB today; EEVEE 0.65 s a frame (0.57 today), Cycles 1.30 s
+(1.47 today). The 4.36-billion-triangle scene renders in well under 16 GB.
+
+**Occlusion Culling** (with Meshlet Instancing, off by default) draws the
+nearest copies' coarse levels into a 256x144 CPU depth buffer (pushed back by
+their error, eroded a pixel) and leaves out hidden copies and pieces; in
+Shadows mode a hidden copy stays while its sun shadow volume is visible. On
+these open scenes it saves only 2-3 % (about 6 % even with an exact
+full-resolution buffer) for 20-30 ms per update, so it stays off.
 
 ## On the web
 
@@ -216,11 +333,42 @@ fetched at a pinned commit (or pass `-DVGEO_MESHOPTIMIZER_DIR=...`).
 The DLL links the C runtime statically so it loads inside Blender with no
 redistributable installed.
 
+## Memory over long renders
+
+`tools/render_memory_bench.py` renders N frames in one session along a camera
+path and logs, per frame, the process's resident and private memory, Blender's
+datablock counts (meshes, orphan meshes, objects, collections) and the native
+runtime's own memory. `--freeze` stops the add-on after frame 1 (objects
+frozen, render handlers removed), to tell its memory from the engine's.
+
+Statue avenue, 100 frames along the 8 film cameras, 1280x720, 4 samples,
+RTX A4500, Blender 5.1.2 (private memory; frame 1 excluded):
+
+| | Frame 2 | Frame 50 | Frame 100 | Second half |
+|---|---|---|---|---|
+| EEVEE, one still per frame | 2,289 MB | 2,706 MB | 2,592 MB | -4.2 % |
+| EEVEE, frozen after frame 1 | 2,297 MB | 2,657 MB | 2,576 MB | -3.1 % |
+| EEVEE, animation render | 2,226 MB | 2,691 MB | 2,737 MB | +1.7 % (1.5 MB/frame) |
+| Cycles (OptiX), one still per frame | 4,536 MB | 5,235 MB | 4,836 MB | -7.6 % |
+| Cycles, frozen after frame 1 | 4,212 MB | 4,207 MB | 4,207 MB | 0.0 % |
+| Cycles, animation render | 4,377 MB | 5,232 MB | 5,041 MB | -3.7 % |
+
+Memory grows while the camera path first visits the scene (EEVEE's GPU
+caches; the native heap goes from 31 to 61 MB as streamed copies size their
+scratch buffers), then stays flat: no leak on a GPU. Datablock counts never
+change and no orphan meshes appear. The 0.3-0.6 GB per frame seen while
+rendering the demo film came from EEVEE's software-GL path (headless, no
+GPU), which these runs do not use.
+
 ## Tests
 
 ```
 blender -b --factory-startup --python tests/test_stream.py
 blender scene.blend --python tests/viewport_bench.py -- --motion fly|orbit
+blender -b scene.blend --python tools/instancing_bench.py -- --cameras cams.json --offscreen COARSEN,SHADOWS,CULL
+blender -b --factory-startup --python tools/instancing_bench.py -- --synthetic
+blender -b scene.blend --python tools/render_memory_bench.py -- --cameras cams.json --frames 100 --engine EEVEE|CYCLES [--freeze]
+blender scene.blend --python tests/viewport_bench.py -- --cameras cams.json --seconds 20 --offscreen SHADOWS
 ```
 
 ## Toward the web
@@ -236,5 +384,10 @@ cut selection if needed.
   relations rebuild, ~0.1 s in EEVEE); later reassignments reuse them.
 - Building without a full Blender mesh in memory (import straight from
   disk, or tiled builds), for sources beyond what Blender can hold.
-- Rare back-to-back "fins" left by simplification (about 3 per 100k
-  triangles at coarse levels) are harmless but could be filtered.
+- Back-to-back "fins" (two triangles on the same three positions, opposite
+  winding) left by simplification are removed when an asset is built: free
+  fins entirely, fins that plug a hole down to the side that agrees with its
+  neighbours. They rendered as dark specks in Cycles (0.2-4 % of the
+  triangles of coarse levels of a flat-shaded sphere); after the fix every
+  level is watertight and under 0.1 % remain (fins whose edges disagree, left
+  alone). Assets built before keep theirs until re-virtualized.

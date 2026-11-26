@@ -114,7 +114,11 @@ def default_path(obj, uid):
         folder = bpy.path.abspath("//vgeo")
         os.makedirs(folder, exist_ok=True)
         return os.path.join(folder, name), "//vgeo/" + name
-    folder = bpy.utils.user_resource('DATAFILES', path="vgeo", create=True)
+    pkg = __package__ or ""
+    if pkg.startswith("bl_ext.") and hasattr(bpy.utils, "extension_path_user"):
+        folder = bpy.utils.extension_path_user(pkg, path="assets", create=True)   # installed as an extension
+    else:
+        folder = bpy.utils.user_resource('DATAFILES', path="vgeo", create=True)
     full = os.path.join(folder, name)
     return full, full
 

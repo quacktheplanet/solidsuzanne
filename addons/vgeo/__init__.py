@@ -8,17 +8,19 @@ with full materials while Blender only ever holds what the view needs.
 bl_info = {
     "name": "VGEO Virtualized Geometry",
     "author": "Lucas DeMeritt",
-    "version": (0, 2, 0),
-    "blender": (5, 0, 0),
+    "version": (0, 3, 0),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar > VGEO",
     "description": "Nanite-style streamed LOD for huge meshes, rendered natively by EEVEE and Cycles",
     "category": "Object",
 }
 
+import os
+
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-from . import build, instances, native, stream
+from . import build, debug, instances, native, scatter, stream
 
 
 def _invalidate(self, _context):
@@ -66,14 +68,41 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
     source: PointerProperty(type=bpy.types.Object, name="Asset",
                             description="The virtualized object these placements show")
     levels: PointerProperty(type=bpy.types.Collection, name="Levels")
+    use_atoms: BoolProperty(
+        name="Meshlet Instancing", default=False,
+        description="Draw every copy as its own meshlet cut, made of instanced pieces of the asset (cut "
+                    "atoms) that never change, instead of whole-asset levels and streamed copies",
+        update=lambda self, ctx: instances.set_use_atoms(self.id_data, self.use_atoms))
+    use_occlusion: BoolProperty(
+        name="Occlusion Culling", default=False,
+        description="With Meshlet Instancing: leave out copies and pieces hidden behind the nearest copies "
+                    "(in Shadows mode only when their shadow is hidden too)")
+    atoms: PointerProperty(type=bpy.types.Collection, name="Atoms")
+    atom_points: PointerProperty(type=bpy.types.Object, name="Atom Points")
     pixel_error: FloatProperty(name="Viewport Error", default=1.0, min=0.1, soft_max=8.0, subtype='PIXEL')
     render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0, subtype='PIXEL')
     min_level: IntProperty(name="Finest Level", default=0, min=0, soft_max=8,
                            description="Never use levels finer than this (caps memory for very dense assets)")
-    stream_slots: IntProperty(name="Streamed Copies", default=4, min=0, max=16,
-                              description="Copies close enough to want full detail get a view-dependent "
-                                          "streamed cut of their own instead of a whole-asset level "
-                                          "(fine where you look, coarse elsewhere); at most this many")
+    stream_slots: IntProperty(name="Streamed Copies", default=8, min=0, max=64,
+                              description="The copies whose whole-asset level costs the most triangles get a "
+                                          "view-dependent streamed cut of their own instead (fine where you "
+                                          "look, coarse elsewhere); at most this many")
+    offscreen: EnumProperty(
+        name="Off-screen", default='COARSEN',
+        items=[('COARSEN', "Coarsen", "Keep copies outside the view at reduced detail, so they still cast "
+                                      "shadows and show in reflections"),
+               ('SHADOWS', "Shadows", "Drop copies outside the view unless they can shadow what it shows: "
+                                      "copies whose shadow from a sun lamp can reach the view, and copies "
+                                      "within reach of a point or spot lamp that lights the view, are kept "
+                                      "(reflections of dropped copies are lost; with no shadow-casting "
+                                      "lamp this is the same as Cull)"),
+               ('CULL', "Cull", "Drop every copy outside the view (fastest; their shadows and reflections "
+                                "are lost)")])
+    offscreen_scale: FloatProperty(name="Off-screen Error", default=8.0, min=1.0, soft_max=64.0,
+                                   description="Error multiplier for copies outside the view that are kept")
+    shadow_distance: FloatProperty(name="Shadow Reach", default=0.0, min=0.0, subtype='DISTANCE',
+                                   description="How far a copy's shadow can reach along the sun's light. "
+                                               "0 estimates it from the copy's size and the sun's height")
     freeze: BoolProperty(name="Freeze", default=False)
     shown_triangles: IntProperty(name="Shown Triangles", options={'HIDDEN'})
 
@@ -117,7 +146,7 @@ class VGEO_OT_scatter(bpy.types.Operator):
 
 
 class VGEO_OT_rebuild_levels(bpy.types.Operator):
-    """Rebuild the instancer's level meshes from its asset (after re-virtualizing or changing materials)"""
+    """Rebuild the instancer's level meshes (and atom libraries) from its asset (after re-virtualizing or changing materials)"""
     bl_idname = "vgeo.rebuild_levels"
     bl_label = "Rebuild Levels"
 
@@ -129,6 +158,8 @@ class VGEO_OT_rebuild_levels(bpy.types.Operator):
     def execute(self, context):
         ob = context.active_object
         instances.build_levels(ob, ob.vgeo_inst.source)
+        if ob.vgeo_inst.use_atoms or ob.vgeo_inst.atoms is not None:
+            instances.rebuild_atoms(ob)
         return {'FINISHED'}
 
 
@@ -307,6 +338,7 @@ class VGEO_OT_refresh(bpy.types.Operator):
 
     def execute(self, context):
         stream.invalidate_all(close=True)
+        instances.close_atom_assets()
         return {'FINISHED'}
 
 
@@ -325,6 +357,9 @@ class VGEO_PT_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        row = layout.row(align=True)
+        row.prop(context.scene, "vgeo_debug", text="")
+        row.prop(context.scene, "vgeo_stats", text="", icon='INFO')
         ob = context.active_object
         if not native.available():
             layout.label(text="Native library missing", icon='ERROR')
@@ -343,7 +378,17 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.prop(vi, "pixel_error")
             layout.prop(vi, "render_pixel_error")
             layout.prop(vi, "min_level")
-            layout.prop(vi, "stream_slots")
+            if native.has_atoms():
+                layout.prop(vi, "use_atoms")
+                if vi.use_atoms and native.has_occlusion():
+                    layout.prop(vi, "use_occlusion")
+            if not vi.use_atoms:
+                layout.prop(vi, "stream_slots")
+            layout.prop(vi, "offscreen")
+            if vi.offscreen != 'CULL':
+                layout.prop(vi, "offscreen_scale")
+            if vi.offscreen == 'SHADOWS':
+                layout.prop(vi, "shadow_distance")
             row = layout.row(align=True)
             row.prop(vi, "freeze", toggle=True, icon='FREEZE')
             row.operator(VGEO_OT_rebuild_levels.bl_idname, icon='FILE_REFRESH')
@@ -352,12 +397,21 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
             if ob is not None and ob.type == 'MESH':
                 layout.label(text=f"{len(ob.data.polygons):,} faces")
+            if ob is not None:
+                row = layout.row(align=True)
+                row.operator(VGEO_OT_virtualize_instances.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
+                row.operator(VGEO_OT_restore_instances.bl_idname, text="", icon='LOOP_BACK')
             return
         v = ob.vgeo
         rt = stream._runtimes.get(v.uid)
         box = layout.box()
         if rt is None or rt.asset is None:
-            box.label(text=(rt.error if rt else "Waiting for first update"), icon='INFO')
+            if rt is not None and rt.error:
+                box.label(text="Asset file not found:", icon='ERROR')
+                box.label(text=bpy.path.abspath(v.path))
+                box.operator(VGEO_OT_find_missing.bl_idname, icon='VIEWZOOM')
+            else:
+                box.label(text="Waiting for first update", icon='INFO')
         else:
             src = rt.asset.info["source_triangles"]
             col = box.column(align=True)
@@ -386,12 +440,123 @@ class VGEO_PT_panel(bpy.types.Panel):
         layout.operator(VGEO_OT_scatter.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
 
 
+def missing_assets():
+    """Proxies whose .vgeo file is not where they point."""
+    return [o for o in bpy.data.objects if o.vgeo.uid and o.vgeo.path and o.library is None
+            and not os.path.exists(bpy.path.abspath(o.vgeo.path))]
+
+
+def find_missing_assets(folder):
+    """Point every proxy with a missing .vgeo at a file of the same name under folder (searched
+    recursively). Returns (found, still missing)."""
+    files = {}
+    for root, _dirs, names in os.walk(folder):
+        for n in names:
+            if n.lower().endswith(".vgeo"):
+                files.setdefault(n.lower(), os.path.join(root, n))
+    found, missing = 0, 0
+    for ob in missing_assets():
+        hit = files.get(os.path.basename(bpy.path.abspath(ob.vgeo.path)).lower())
+        if hit is None:
+            missing += 1
+            continue
+        try:
+            ob.vgeo.path = bpy.path.relpath(hit) if bpy.data.filepath else hit
+        except ValueError:   # another drive: no relative path
+            ob.vgeo.path = hit
+        found += 1
+    if found:
+        stream.invalidate_all(close=True)
+        instances.close_atom_assets()
+    return found, missing
+
+
+class VGEO_OT_find_missing(bpy.types.Operator):
+    """Look for missing VGEO asset files (.vgeo) in a folder and its subfolders, by file name"""
+    bl_idname = "vgeo.find_missing"
+    bl_label = "Find Missing Assets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(subtype='DIR_PATH')
+
+    def invoke(self, context, _event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        if not self.directory or not os.path.isdir(self.directory):
+            self.report({'ERROR'}, "Choose a folder")
+            return {'CANCELLED'}
+        found, missing = find_missing_assets(self.directory)
+        msg = f"Found {found} asset file(s)" + (f", {missing} still missing" if missing else "")
+        self.report({'WARNING'} if missing else {'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class VGEO_OT_virtualize_instances(bpy.types.Operator):
+    """Hand the active object's instances of virtualized meshes (Geometry Nodes, particles, collection
+    instances) to VGEO instancers, and switch its own instances off"""
+    bl_idname = "vgeo.virtualize_instances"
+    bl_label = "Virtualize Instances"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    meshlet_instancing: BoolProperty(name="Meshlet Instancing", default=True,
+                                     description="Draw every copy as its own meshlet cut")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and not ob.vgeo.uid and not ob.vgeo_inst.uid and context.mode == 'OBJECT'
+
+    def execute(self, context):
+        src = context.active_object
+        made, missing, spread = scatter.virtualize_instances(context, src)
+        for m, why in missing.items():
+            if isinstance(why, int):
+                self.report({'WARNING'}, f"{m}: {why} instances left as they are; virtualize {m} first")
+            else:
+                self.report({'WARNING'}, f"{m}: {why} instances left as they are: its VGEO asset could not be opened")
+        if not made:
+            if not missing:
+                self.report({'ERROR'}, f"{src.name} has no instances of meshes")
+            return {'CANCELLED'}
+        if spread > 0.01:
+            self.report({'WARNING'}, f"Non-uniform instance scale approximated (up to {spread:.0%} apart)")
+        views = stream.viewport_views() if context.window_manager.windows else []
+        for inst in made:
+            if not self.meshlet_instancing:
+                inst.vgeo_inst.use_atoms = False
+            if views:
+                instances.update(inst, views, inst.vgeo_inst.pixel_error)
+        n = sum(len(i.data.vertices) for i in made)
+        self.report({'INFO'}, f"{n:,} instances in {len(made)} VGEO instancer(s)")
+        return {'FINISHED'}
+
+
+class VGEO_OT_restore_instances(bpy.types.Operator):
+    """Bring back the active object's own instances and delete the VGEO instancers made from them"""
+    bl_idname = "vgeo.restore_instances"
+    bl_label = "Restore Instances"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and any(o.get(scatter.MADE_PROP) == ob.name for o in bpy.data.objects)
+
+    def execute(self, context):
+        scatter.restore_instances(context.active_object)
+        return {'FINISHED'}
+
+
 classes = (VGEOObjectSettings, VGEOInstanceSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web,
-           VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_PT_panel)
+           VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_OT_virtualize_instances,
+           VGEO_OT_restore_instances, VGEO_OT_find_missing, VGEO_PT_panel)
 
 
 def _menu(self, _context):
     self.layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
+    self.layout.operator(VGEO_OT_virtualize_instances.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
 
 
 def register():
@@ -400,11 +565,13 @@ def register():
     bpy.types.Object.vgeo = PointerProperty(type=VGEOObjectSettings)
     bpy.types.Object.vgeo_inst = PointerProperty(type=VGEOInstanceSettings)
     bpy.types.VIEW3D_MT_object.append(_menu)
+    debug.register()
     stream.register()
 
 
 def unregister():
     stream.unregister()
+    debug.unregister()
     bpy.types.VIEW3D_MT_object.remove(_menu)
     del bpy.types.Object.vgeo_inst
     del bpy.types.Object.vgeo

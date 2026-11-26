@@ -3,6 +3,7 @@
 Run:  blender -b --factory-startup --python tests/test_stream.py [-- --out DIR]
 """
 
+import math
 import os
 import sys
 import tempfile
@@ -442,6 +443,13 @@ def run():
     rc = bpy.ops.vgeo.scatter(count=400, seed=3, scale_min=0.6, scale_max=1.2)
     inst = bpy.context.active_object
     check("scatter creates an instancer", rc == {'FINISHED'} and inst.vgeo_inst.uid and len(inst.data.vertices) == 400)
+    check("new instancers default to Shadows, the property (old files) to Coarsen",
+          inst.vgeo_inst.offscreen == 'SHADOWS'
+          and type(inst.vgeo_inst).bl_rna.properties["offscreen"].default == 'COARSEN')
+    check("new instancers use meshlet instancing", inst.vgeo_inst.use_atoms == native.has_atoms()
+          and not type(inst.vgeo_inst).bl_rna.properties["use_atoms"].default)
+    inst.vgeo_inst.use_atoms = False       # the checks below are about whole-copy levels and streamed copies
+    inst.vgeo_inst.offscreen = 'COARSEN'   # the checks below were written against Coarsen
     errs = list(inst["vgeo_level_errors"])
     lvl_tris = list(inst["vgeo_level_tris"])
     check("one level mesh per LOD level", len(inst.vgeo_inst.levels.objects) == len(errs) == rt.asset.info["lod_levels"],
@@ -482,7 +490,7 @@ def run():
     sl = instances.slots(inst)
     assigned = sorted(o.vgeo.slot_index for o in sl if o.vgeo.slot_index >= 0)
     flags = instances._streamed_flags(inst)
-    check("streamed copies assigned to the nearest full-detail copies",
+    check("streamed copies assigned to the heaviest copies, the close-up one first",
           len(sl) == 2 and target in assigned and all(o.hide_select for o in sl), str(assigned))
     check("instance kept until the streamed cut lands", not flags.any())
     for _ in range(400):
@@ -537,6 +545,326 @@ def run():
         check(f"{eng} renders the instancer", os.path.exists(scene.render.filepath))
     shown_render = inst.vgeo_inst.shown_triangles
     check("render cut uses the render error", shown_render > 0, f"{shown_render:,} tris at 0.5 px")
+
+    # streamed copies go to the copies whose level meshes cost the most, at any level (a copy that
+    # wants level 1 up close wastes as much as one that wants level 0); a copy that holds one keeps
+    # it against an equally heavy copy, so slots do not flip back and forth
+    inst.vgeo_inst.stream_slots = 2
+    instances.assign_slots(inst, [])
+    n = len(inst.data.vertices)
+    lv_fake = np.full(n, len(lvl_tris) - 1, np.int32)
+    a, b, c = 5, 17, 42
+    lv_fake[[a, b, c]] = [1, 2, 2]
+    nearness = np.arange(n, dtype=np.float64)   # lower index = nearer
+    want = instances._wanted_slots(inst, lv_fake, nearness)
+    check("streamed copies go to the heaviest copies, at any level", want == [a, b], str(want))
+    instances.assign_slots(inst, [a, c])
+    want = instances._wanted_slots(inst, lv_fake, nearness)
+    check("a copy keeps its streamed cut against an equally heavy one", want == [a, c], str(want))
+    instances.assign_slots(inst, [])
+
+    # off-screen copies: Cull leaves them out of the instancing, and draws fewer triangles
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    views = [stream.camera_view(scene)]
+    inst.vgeo_inst.stream_slots = 0
+    inst.vgeo_inst.offscreen = 'COARSEN'
+    instances.update(inst, views, 1.0)
+    coarsen_tris = inst.vgeo_inst.shown_triangles
+    inst.vgeo_inst.offscreen = 'CULL'
+    instances.update(inst, views, 1.0)
+    lv = np.empty(n, np.int32)
+    inst.data.attributes["vgeo_level"].data.foreach_get("value", lv)
+    culled = int((lv < 0).sum())
+    dg = bpy.context.evaluated_depsgraph_get()
+    n_inst = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == inst)
+    check("cull leaves copies outside the view out", 0 < culled < n and n_inst == n - culled,
+          f"{culled} culled, {n_inst} instanced")
+    check("culling draws fewer triangles", inst.vgeo_inst.shown_triangles < coarsen_tris,
+          f"{inst.vgeo_inst.shown_triangles:,} vs {coarsen_tris:,}")
+
+    # Sun Shadows: one copy in view, one left of it, one right of it; the light comes from the left,
+    # so only the left copy's shadow can fall into the view
+    lights = {o.name: o.hide_render for o in scene.objects if o.type == 'LIGHT'}
+    for name in lights:
+        scene.objects[name].hide_render = True
+    sun = bpy.data.objects.new("ShadowSun", bpy.data.lights.new("ShadowSun", "SUN"))
+    sun.rotation_euler = Vector((1.0, 0.0, -0.3)).to_track_quat('-Z', 'Y').to_euler()
+    scene.collection.objects.link(sun)
+    me = bpy.data.meshes.new("ShadowTest")
+    pts3 = np.array([(0, 20, 0), (-22, 20, 0), (22, 20, 0)], np.float32)
+    me.vertices.add(3)
+    me.vertices.foreach_set("co", pts3.ravel())
+    me.attributes.new(instances.LEVEL_ATTR, 'INT', 'POINT')
+    me.update()
+    st = bpy.data.objects.new("ShadowTest", me)
+    scene.collection.objects.link(st)
+    st.vgeo_inst.uid = stream.new_uid()
+    st.vgeo_inst.source = proxy
+    st.vgeo_inst.stream_slots = 0
+    instances.build_levels(st, proxy)
+    camera((0, -12, 1.5), target=(0, 20, 1.5), lens=35)
+    bpy.context.view_layer.update()
+    views = [stream.camera_view(scene)]
+    st.vgeo_inst.offscreen = 'SHADOWS'
+    instances.update(st, views, 1.0)
+    lv3 = np.empty(3, np.int32)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    dg = bpy.context.evaluated_depsgraph_get()
+    n3 = sum(1 for i in dg.object_instances if i.is_instance and i.parent and i.parent.original == st)
+    check("sun shadows keep the copy whose shadow reaches the view",
+          lv3[0] >= 0 and lv3[1] >= 0 and lv3[2] < 0 and n3 == 2, f"levels {lv3.tolist()}, {n3} instanced")
+    st.vgeo_inst.offscreen = 'CULL'
+    instances.update(st, views, 1.0)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    check("cull drops it", lv3[0] >= 0 and lv3[1] < 0 and lv3[2] < 0, str(lv3.tolist()))
+    sun.hide_render = True
+    st.vgeo_inst.offscreen = 'SHADOWS'
+    instances.update(st, views, 1.0)
+    st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
+    check("without a sun, sun shadows culls like Cull", lv3[1] < 0, str(lv3.tolist()))
+
+    def levels3(light_ob):
+        scene.collection.objects.link(light_ob)
+        bpy.context.view_layer.update()
+        instances.update(st, views, 1.0)
+        out = np.empty(3, np.int32)
+        st.data.attributes["vgeo_level"].data.foreach_get("value", out)
+        bpy.data.objects.remove(light_ob)
+        return out
+
+    def lamp(kind, pos, dist, down=True, size=None):
+        la = bpy.data.lights.new("ShadowLamp", kind)
+        la.use_custom_distance, la.cutoff_distance = True, dist
+        if size is not None:
+            la.spot_size = size
+        ob = bpy.data.objects.new("ShadowLamp", la)
+        ob.location = pos
+        ob.rotation_euler = (0, 0, 0) if down else (math.pi, 0, 0)
+        return ob
+
+    # a point lamp beside the view, its light reaching both the left copy and the view
+    lv = levels3(lamp('POINT', (-22, 20, 3), 10))
+    check("point lamp keeps the copy it lights", lv[0] >= 0 and lv[1] >= 0 and lv[2] < 0, str(lv.tolist()))
+    # a point lamp that reaches the left copy, but whose light never reaches the view
+    lv = levels3(lamp('POINT', (-40, 20, 3), 19))
+    check("point lamp out of the view's reach keeps nothing", lv[1] < 0 and lv[2] < 0, str(lv.tolist()))
+    # a spot lamp above the left copy: kept when it points down at it, dropped when it points away
+    lv = levels3(lamp('SPOT', (-22, 20, 10), 15, down=True, size=math.radians(40)))
+    check("spot lamp keeps the copy in its cone", lv[1] >= 0 and lv[2] < 0, str(lv.tolist()))
+    lv = levels3(lamp('SPOT', (-22, 20, 10), 15, down=False, size=math.radians(40)))
+    check("spot lamp pointing away keeps nothing", lv[1] < 0 and lv[2] < 0, str(lv.tolist()))
+    # shadow_lights is cached only inside a tick scope, and the cache ends with it
+    with instances.tick_scope():
+        first = instances.shadow_lights(scene)
+        check("lights cached within a tick", instances.shadow_lights(scene) is first)
+    check("light cache cleared after the tick", instances._lights_cache is None)
+    col = st.vgeo_inst.levels
+    bpy.data.objects.remove(st)
+    for o in list(col.objects):
+        bpy.data.objects.remove(o)
+    bpy.data.collections.remove(col)
+    bpy.data.objects.remove(sun)
+    for name, hidden in lights.items():
+        scene.objects[name].hide_render = hidden
+
+    # ---- meshlet instancing: every copy cut into atoms (clusters sharing a (group, refined) pair)
+    if native.has_atoms():
+        asset = native.Asset(stream.asset_path(proxy))
+        atoms = asset.atoms()
+        check("atoms partition the clusters", int(atoms["cluster_count"].sum()) == asset.info["cluster_count"]
+              and len(np.unique(atoms["group"].astype(np.int64) * (1 << 32) + atoms["refined"] + 1)) == len(atoms),
+              f"{len(atoms)} atoms")
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(scene)]
+        v, window, height, persp, clip_start = views[0]
+        tr, sc = instances.copy_transforms(inst)
+        # the per-cluster cut of each copy (local view) against one call for all copies
+        same = {}
+        for mode in ("FULL", "COARSEN", "CULL"):
+            pairs, st = instances.select_atoms(inst, asset, views, 1.0, mode=mode, transforms=(tr, sc))
+            got = np.bincount(pairs[:, 0], weights=atoms["tri_count"][pairs[:, 1]], minlength=len(sc))
+            per = np.zeros(len(sc), np.int64)
+            for i in range(len(sc)):
+                m = inst.matrix_world @ instances.placement_matrix(inst, i)
+                s = max(abs(x) for x in m.to_scale())
+                lv = native.make_view(m.inverted() @ v.inverted().translation, window[1][1],
+                                      max(clip_start / s, 1e-6), 1.0 / height,
+                                      planes=stream._frustum_planes(window @ v @ m), mode=mode, offscreen_scale=8.0)
+                asset.select([lv])
+                per[i] = int(asset.last.triangles)
+            if mode == "CULL":   # copies outside skipped by the asset's tighter bounds; the rest match
+                same[mode] = bool(np.all((got == per) | (got == 0)))
+            else:
+                same[mode] = bool(np.array_equal(got.astype(np.int64), per))
+            same[mode + "_tris"] = int(got.sum())
+        check("atom cut equals the per-cluster cut on every copy", same["FULL"] and same["COARSEN"] and same["CULL"],
+              str(same))
+        check("culled atoms draw fewer triangles", same["CULL_tris"] < same["COARSEN_tris"] < same["FULL_tris"])
+        # an instanced cut is crack-free: a copy seen from close up mixes levels, its atoms weld shut
+        near = int(np.argmin(np.linalg.norm(tr[:, :, 3] - np.array([0.0, 10.0, -1.0]), axis=1)))
+        p = tr[near, :, 3]
+        camera(tuple(p + np.array([0.0, -1.6, 0.5]) * float(inst["vgeo_radius"]) * float(sc[near])),
+               target=tuple(p), lens=24)
+        views = [stream.camera_view(scene)]
+        pairs, st = instances.select_atoms(inst, asset, views, 1.0, mode="COARSEN", transforms=(tr, sc))
+        mine = pairs[pairs[:, 0] == near, 1]
+        pos_all, tri_all, base = [], [], 0
+        for k in mine:
+            d = asset.extract_atom(int(k))
+            pos_all.append(d["positions"].reshape(-1, 3))
+            tri_all.append(d["corner_verts"].reshape(-1, 3) + base)
+            base += d["vertex_count"]
+        depths = set(atoms["depth"][mine].tolist())
+        oe = open_edges(np.concatenate(pos_all), np.concatenate(tri_all))
+        check("instanced atom cut is watertight", oe == 0 and len(depths) >= 2,
+              f"{oe} open edges, {len(mine)} atoms, depths {sorted(depths)}")
+        # blocks: the atoms of one parent group drawn as one piece when all are in the cut
+        blocks = asset.atoms(blocks=True)
+        unit_tris = np.concatenate([atoms["tri_count"], blocks["tri_count"]]).astype(np.int64)
+        bpairs, bst = asset.select_instances(instances.world_views(views, 1.0), tr, sc, mode="COARSEN", blocks=True)
+        per_a = np.bincount(pairs[:, 0], weights=atoms["tri_count"][pairs[:, 1]], minlength=len(sc))
+        per_b = np.bincount(bpairs[:, 0], weights=unit_tris[bpairs[:, 1]], minlength=len(sc))
+        check("blocks draw the same cut with fewer instances",
+              np.array_equal(per_a, per_b) and len(blocks) > 0 and (bpairs[:, 1] >= len(atoms)).any()
+              and len(bpairs) < len(pairs), f"{len(pairs)} atoms -> {len(bpairs)} units, {len(blocks)} blocks")
+        mine = bpairs[bpairs[:, 0] == near, 1]
+        pos_all, tri_all, base = [], [], 0
+        for k in mine:
+            d = asset.extract_atom(int(k))
+            pos_all.append(d["positions"].reshape(-1, 3))
+            tri_all.append(d["corner_verts"].reshape(-1, 3) + base)
+            base += d["vertex_count"]
+        oe = open_edges(np.concatenate(pos_all), np.concatenate(tri_all))
+        check("cut with blocks is watertight", oe == 0 and base > 0, f"{oe} open edges")
+        asset.close()
+
+        # the instancer switched to meshlet instancing: atom meshes, a point per pair, real instances
+        inst.vgeo_inst.offscreen = 'COARSEN'
+        inst.vgeo_inst.use_atoms = True
+        libs = instances.atom_libraries(inst)
+        lib_tris = sum(len(o.data.polygons) for o in libs.values())
+        check("meshlet instancing: an atom library per slice, a cloud per slice, no streamed copies",
+              lib_tris == int(sum(inst["vgeo_atom_tris"]))
+              and len(libs) == -(-len(atoms) // instances.ATOM_SLICE) == len(instances.atom_clouds(inst))
+              and all(o.vgeo.slot_index < 0 for o in instances.slots(inst)))
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(scene)]
+
+        def drawn():
+            dg = bpy.context.evaluated_depsgraph_get()
+            n, tris = 0, 0
+            for i in dg.object_instances:
+                if i.is_instance and i.parent and (i.parent.original == inst
+                                                  or i.parent.original.get(instances.SLICE_PROP) is not None):
+                    n += 1
+                    tris += len(i.object.data.polygons)
+            return n, tris
+
+        instances.update(inst, views, 1.0)
+        n_c, t_c = drawn()
+        npts = sum(int((np.array([v.value for v in o.data.attributes[instances.ATOM_ATTR].data]) >= 0).sum())
+                   for o in instances.atom_clouds(inst).values())
+        check("one instance per (copy, atom) pair, nothing from levels",
+              n_c == npts > 0 and t_c == inst.vgeo_inst.shown_triangles, f"{n_c} instances, {npts} points, "
+              f"{t_c:,} vs {inst.vgeo_inst.shown_triangles:,} tris")
+        check("meshlet instancing draws the per-cluster cut", t_c == same["COARSEN_tris"],
+              f"{t_c:,} vs {same['COARSEN_tris']:,}")
+        inst.vgeo_inst.offscreen = 'CULL'
+        instances.update(inst, views, 1.0)
+        n_x, t_x = drawn()
+        check("culled atoms leave the instancing", n_x < n_c and t_x < t_c, f"{n_x} < {n_c}")
+        # final renders cut at the render error
+        inst.vgeo_inst.render_pixel_error = 0.5
+        stream.update_for_render(scene)
+        n_r, t_r = drawn()
+        check("final render cuts at the render error", t_r > t_x, f"{t_r:,} vs {t_x:,}")
+        inst.vgeo_inst.offscreen = 'COARSEN'
+        # clouds follow the instancer's visibility
+        clouds = list(instances.atom_clouds(inst).values())
+        inst.hide_render = True
+        stream.update_for_render(scene)
+        hidden_r = all(o.hide_render for o in clouds)
+        inst.hide_render = False
+        stream.update_for_render(scene)
+        vl = bpy.context.view_layer
+        inst.hide_set(True)
+        instances.sync_cloud_visibility(inst, vl)
+        hidden_v = all(not o.visible_get() for o in clouds)
+        inst.hide_set(False)
+        instances.sync_cloud_visibility(inst, vl)
+        check("atom clouds hide with their instancer", hidden_r and hidden_v and clouds
+              and all(o.visible_get() and not o.hide_render for o in clouds))
+        bpy.ops.wm.save_mainfile()
+        kept = all(len(o.data.polygons) for o in instances.atom_libraries(inst).values())
+        bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
+        inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
+        scene = bpy.context.scene
+        empty = all(o.data.name == instances.EMPTY_LIBRARY for o in instances.atom_libraries(inst).values())
+        check("atom libraries are not saved (refilled from the .vgeo), and stay in the session",
+              kept and empty and instances.atom_libraries(inst))
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(bpy.context.scene)]
+        instances.update(inst, views, 1.0)
+        n_l, t_l = drawn()
+        check("meshlet instancing survives save/load", inst.vgeo_inst.use_atoms and n_l == n_c and t_l == t_c,
+              f"{n_l} vs {n_c}")
+        # moving a placement moves its atoms even when the pairs stay the same
+        instances.update(inst, [stream.camera_view(bpy.context.scene)], 1.0)
+        cl0 = next(o for o in instances.atom_clouds(inst).values()
+                   if (np.array([v.value for v in o.data.attributes[instances.ATOM_ATTR].data]) >= 0).any())
+        idx = np.array([v.value for v in cl0.data.attributes[instances.ATOM_ATTR].data])
+        pts = np.array([tuple(v.co) for v in cl0.data.vertices])[idx >= 0]
+        all_co = np.array([tuple(v.co) for v in inst.data.vertices])
+        c = int(np.argmin(np.linalg.norm(all_co - pts[0], axis=1)))
+        inst.data.vertices[c].co.z += 0.01
+        inst.data.update()
+        instances.update(inst, [stream.camera_view(bpy.context.scene)], 1.0)
+        pts2 = np.array([tuple(v.co) for v in cl0.data.vertices])
+        check("a moved placement moves its atoms", np.isclose(pts2[:, 2], all_co[c, 2] + 0.01, atol=1e-5).any())
+        inst.data.vertices[c].co.z -= 0.01
+        inst.data.update()
+        stream._on_undo()
+        check("undo forgets what the clouds held", not instances._atom_state and not instances._atom_pace)
+        # two views: the cut satisfies both (no fewer triangles than either alone)
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        v1 = stream.camera_view(bpy.context.scene)
+        camera((30, 10, 4), target=(0, 10, -1), lens=35)
+        v2 = stream.camera_view(bpy.context.scene)
+        t_each = []
+        for vv in ([v1], [v2], [v1, v2]):
+            instances.update(inst, vv, 1.0)
+            t_each.append(inst.vgeo_inst.shown_triangles)
+        check("two views: the cut serves both", t_each[2] >= max(t_each[0], t_each[1]), str(t_each))
+        # Rebuild Levels also rebuilds the atom libraries (fresh handle), clouds keep working
+        libs_before = sorted(o.name for o in instances.atom_libraries(inst).values())
+        bpy.context.view_layer.objects.active = inst
+        rc = bpy.ops.vgeo.rebuild_levels()
+        instances.update(inst, [v1], 1.0)
+        n_rb, t_rb = drawn()
+        check("rebuild keeps meshlet instancing working", rc == {'FINISHED'} and n_rb > 0
+              and t_rb == t_each[0] and len(instances.atom_libraries(inst)) == len(libs_before), f"{t_rb:,}")
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(bpy.context.scene)]
+        inst.vgeo_inst.use_atoms = False
+        instances.update(inst, views, 1.0)
+        n_o, _ = drawn()
+        check("switching back shows whole-copy levels", n_o == len(inst.data.vertices), str(n_o))
+        # a deleted instancer's clouds leave the scene (on a copy, so the rest of the suite keeps it)
+        dup = inst.copy()
+        dup.data = inst.data.copy()
+        dup.vgeo_inst.uid = stream.new_uid()
+        dup.vgeo_inst.atoms = None
+        bpy.context.scene.collection.objects.link(dup)
+        dup.vgeo_inst.use_atoms = True
+        dclouds = [o.name for o in instances.atom_clouds(dup).values()]
+        bpy.data.objects.remove(dup)
+        instances.unlink_orphan_slots()
+        gone = all(not bpy.data.objects[n].users_collection for n in dclouds if n in bpy.data.objects)
+        check("a deleted instancer's clouds leave the scene", bool(dclouds) and gone, str(len(dclouds)))
+        proxy = next(o for o in bpy.data.objects if o.vgeo.uid)
+
+    inst.vgeo_inst.offscreen = 'COARSEN'
+    inst.vgeo_inst.stream_slots = 2
     bpy.ops.wm.save_mainfile()
     bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
     inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
@@ -650,6 +978,212 @@ def run():
     linked = [c.name for c in bpy.data.collections if gcol.name in c.children]
     linked += [sc.name for sc in bpy.data.scenes if gcol.name in sc.collection.children]
     check("deleted proxy's chunks are unlinked", not linked, str(linked))
+
+    # ---- duplicating a proxy or an instancer: the copy gets an ID (and children) of its own
+    scene = bpy.context.scene
+    proxy.vgeo.path = good
+    inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid and not o.get("vgeo_made_from"))
+    inst.vgeo_inst.use_atoms = True
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    views = [stream.camera_view(scene)]
+    instances.update(inst, views, 1.0)
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    inst.select_set(True)
+    bpy.context.view_layer.objects.active = inst
+    bpy.ops.object.duplicate()
+    dup = bpy.context.active_object
+    n_fixed = stream.fix_duplicates()
+    instances.update(inst, views, 1.0)
+    instances.update(dup, views, 1.0)
+    dg = bpy.context.evaluated_depsgraph_get()
+    def n_of(owner):
+        return sum(1 for i in dg.object_instances if i.is_instance and i.parent
+                   and i.parent.original.parent == owner and instances.SLICE_PROP in i.parent.original)
+    check("a duplicated instancer gets its own ID and clouds", dup != inst and n_fixed >= 1
+          and dup.vgeo_inst.uid != inst.vgeo_inst.uid and n_of(inst) > 0 and n_of(dup) == n_of(inst),
+          f"{n_of(inst)} / {n_of(dup)} instances")
+    bpy.data.objects.remove(dup)
+    instances.unlink_orphan_slots()
+    inst.vgeo_inst.use_atoms = False
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    proxy.select_set(True)
+    bpy.context.view_layer.objects.active = proxy
+    n_chunks = len(proxy.vgeo.collection.objects)
+    bpy.ops.object.duplicate()
+    pdup = bpy.context.active_object
+    stream.fix_duplicates()
+    rt_dup = stream.apply_cut(pdup, views, 1.0, force=True)
+    check("a duplicated proxy streams into chunks of its own",
+          pdup.vgeo.uid != proxy.vgeo.uid and pdup.vgeo.collection not in (None, proxy.vgeo.collection)
+          and rt_dup.triangles > 0 and len(proxy.vgeo.collection.objects) == n_chunks
+          and all(c.parent == pdup for c in pdup.vgeo.collection.objects), f"{rt_dup.triangles:,}")
+    dcol = pdup.vgeo.collection
+    for c in list(dcol.objects):
+        bpy.data.objects.remove(c)
+    bpy.data.collections.remove(dcol)
+    bpy.data.objects.remove(pdup)
+
+    # ---- no fins: simplification must not leave back-to-back triangles (dark specks in Cycles)
+    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=6, radius=1.0, location=(500, 0, 0))
+    flat = bpy.context.object          # flat shaded: every vertex split by normals, the worst case
+    rc = bpy.ops.vgeo.virtualize()
+    fproxy = bpy.context.active_object
+    fa = native.Asset(stream.asset_path(fproxy))
+    worst, open_worst, share = 0, 0, 0.0
+    for depth in range(fa.info["lod_levels"]):
+        d = fa.level_mesh_data(depth)
+        if d is None:
+            continue
+        pos, tri = d["positions"].reshape(-1, 3), d["corner_verts"].reshape(-1, 3)
+        _, weld = np.unique(np.round(pos, 6), axis=0, return_inverse=True)
+        t = weld.ravel()[tri]
+        key = np.sort(t, axis=1)
+        _, inv, cnt = np.unique(key, axis=0, return_inverse=True, return_counts=True)
+        worst = max(worst, int((cnt[inv.ravel()] > 1).sum()))
+        share = max(share, (cnt[inv.ravel()] > 1).mean())
+        open_worst = max(open_worst, open_edges(pos, tri))
+    fa.close()
+    # (a fin whose edges disagree with its neighbours stays: removing either side would open an edge)
+    check("fins removed (< 0.1 % left), every level watertight", rc == {'FINISHED'} and share < 0.001
+          and open_worst == 0, f"{worst} triangles in shared triples ({share:.3%}), {open_worst} open edges")
+
+    # ---- a moved project: Find Missing Assets relinks the .vgeo by file name
+    import shutil
+    moved = os.path.join(OUT, "moved_assets", "deep")
+    os.makedirs(moved, exist_ok=True)
+    shutil.copy(good, moved)
+    proxy.vgeo.path = "//nowhere/" + os.path.basename(good)
+    rt = stream.runtime_for(proxy)
+    lost = vgeo.missing_assets()
+    found, still = vgeo.find_missing_assets(os.path.join(OUT, "moved_assets"))
+    rt = stream.runtime_for(proxy)
+    check("Find Missing Assets relinks a moved .vgeo", proxy in lost and found >= 1 and still == 0
+          and rt.asset is not None and proxy not in vgeo.missing_assets(), bpy.path.abspath(proxy.vgeo.path))
+    proxy.vgeo.path = good
+    stream.runtime_for(proxy)
+
+    # ---- debug views: every mesh VGEO writes carries vgeo_viz while one is on
+    from vgeo import debug as vdebug
+    scene = bpy.context.scene
+    proxy.vgeo.path = good   # the missing-file test above pointed it elsewhere
+    camera((0, -8, 0.2))
+    view = stream.camera_view(scene)
+    scene.vgeo_debug = 'MESHLETS'
+    rt = stream.apply_cut(proxy, [view], 1.0, force=True)
+    viz = [o.data.color_attributes.get("vgeo_viz") for o in stream.fronts(proxy) if len(o.data.polygons)]
+    cols = set()
+    for a in viz:
+        if a is not None:
+            c = np.empty(len(a.data) * 4, np.float32)
+            a.data.foreach_get("color", c)
+            cols.update(map(tuple, np.round(c.reshape(-1, 4)[::3, :3], 2)))
+    lvl_viz = all(o.data.color_attributes.get("vgeo_viz") is not None
+                  for i in instances.instancers(scene) for o in i.vgeo_inst.levels.objects if len(o.data.polygons))
+    check("Meshlets debug view colors each cluster", viz and all(a is not None for a in viz)
+          and len(cols) >= 0.5 * rt.clusters and lvl_viz, f"{len(cols)} colors, {rt.clusters} clusters")
+    scene.vgeo_debug = 'LOD'
+    stream.apply_cut(proxy, [view], 1.0, force=True)
+    a = next(o.data.color_attributes.get("vgeo_viz") for o in stream.fronts(proxy) if len(o.data.polygons))
+    c = np.empty(len(a.data) * 4, np.float32)
+    a.data.foreach_get("color", c)
+    alpha = set(np.round(c.reshape(-1, 4)[:, 3] * 16).astype(int).tolist())
+    check("LOD debug view: alpha holds the depth", a is not None and len(alpha) >= 1 and max(alpha) <= 16, str(alpha))
+    scene.vgeo_debug = 'NONE'
+    stream.apply_cut(proxy, [view], 1.0, force=True)
+    check("debug view off removes the colors",
+          all(o.data.color_attributes.get("vgeo_viz") is None for o in stream.fronts(proxy)))
+    st = vdebug.scene_stats(scene)
+    check("stats overlay counts the scene", st["source"] > st["drawn"] > 0, str(st))
+
+    # ---- Virtualize Instances: an existing scatter handed to VGEO instancers
+    from vgeo import scatter as vscatter
+    proxy.vgeo.path = good   # the missing-file test above pointed it elsewhere
+    stream.runtime_for(proxy)
+    src_mesh = proxy.vgeo.source
+    if src_mesh is not None:
+        scene = bpy.context.scene
+
+        def own_instances(ob):
+            dg = bpy.context.evaluated_depsgraph_get()
+            return [np.array(i.matrix_world) for i in dg.object_instances
+                    if i.is_instance and i.parent and i.parent.original == ob and i.object.original == src_mesh]
+
+        # Geometry Nodes: Distribute Points on Faces -> Instance on Points (Object Info, as instance)
+        bpy.ops.mesh.primitive_plane_add(size=30, location=(300, 0, 0))
+        gn_ground = bpy.context.active_object
+        ng = bpy.data.node_groups.new("ScatterTest", "GeometryNodeTree")
+        ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        n_, L_ = ng.nodes, ng.links
+        gi, go = n_.new("NodeGroupInput"), n_.new("NodeGroupOutput")
+        dist = n_.new("GeometryNodeDistributePointsOnFaces")
+        dist.inputs["Density"].default_value = 0.15
+        oi = n_.new("GeometryNodeObjectInfo")
+        oi.inputs["Object"].default_value = src_mesh
+        oi.inputs["As Instance"].default_value = True
+        rnd = n_.new("FunctionNodeRandomValue")
+        rnd.data_type = 'FLOAT'
+        rnd.inputs[2].default_value, rnd.inputs[3].default_value = 0.5, 1.2
+        iop = n_.new("GeometryNodeInstanceOnPoints")
+        join = n_.new("GeometryNodeJoinGeometry")
+        L_.new(gi.outputs[0], dist.inputs["Mesh"])
+        L_.new(dist.outputs["Points"], iop.inputs["Points"])
+        L_.new(oi.outputs["Geometry"], iop.inputs["Instance"])
+        L_.new(dist.outputs["Rotation"], iop.inputs["Rotation"])
+        L_.new(rnd.outputs[1], iop.inputs["Scale"])
+        L_.new(gi.outputs[0], join.inputs[0])
+        L_.new(iop.outputs[0], join.inputs[0])
+        L_.new(join.outputs[0], go.inputs[0])
+        gn_ground.modifiers.new("Scatter", 'NODES').node_group = ng
+        before = own_instances(gn_ground)
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        gn_ground.select_set(True)
+        bpy.context.view_layer.objects.active = gn_ground
+        rc = bpy.ops.vgeo.virtualize_instances()
+        made = [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == gn_ground.name]
+        ok_place = False
+        if made:
+            mi = made[0]
+            got = [np.array(mi.matrix_world @ instances.placement_matrix(mi, i)) for i in range(len(mi.data.vertices))]
+            key = lambda m: tuple(np.round(m[:3, 3], 4))
+            a_ = sorted(before, key=key)
+            b_ = sorted(got, key=key)
+            ok_place = len(a_) == len(b_) and all(np.allclose(x, y, atol=1e-4) for x, y in zip(a_, b_))
+        after = own_instances(gn_ground)
+        dg = bpy.context.evaluated_depsgraph_get()
+        faces = len(gn_ground.evaluated_get(dg).data.polygons)
+        check("Virtualize Instances takes a Geometry Nodes scatter",
+              rc == {'FINISHED'} and len(made) == 1 and made[0].vgeo_inst.source == proxy and len(before) > 10
+              and ok_place, f"{len(before)} instances")
+        check("the scatter's own instances go, its surface stays", not after and faces == 1, f"{len(after)} left")
+        rc = bpy.ops.vgeo.restore_instances()
+        check("Restore Instances brings them back",
+              rc == {'FINISHED'} and len(own_instances(gn_ground)) == len(before)
+              and not [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == gn_ground.name])
+
+        # a particle system rendering the mesh as objects (hair)
+        bpy.ops.mesh.primitive_plane_add(size=30, location=(360, 0, 0))
+        p_ground = bpy.context.active_object
+        p_ground.modifiers.new("Particles", 'PARTICLE_SYSTEM')
+        st = p_ground.particle_systems[0].settings
+        st.type = 'HAIR'
+        st.count = 40
+        st.render_type = 'OBJECT'
+        st.instance_object = src_mesh
+        st.particle_size = 0.5
+        before = own_instances(p_ground)
+        rc = bpy.ops.vgeo.virtualize_instances()
+        made = [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == p_ground.name]
+        check("Virtualize Instances takes a particle system",
+              rc == {'FINISHED'} and len(made) == 1 and len(made[0].data.vertices) == len(before) == 40
+              and not own_instances(p_ground) and st.render_type == 'NONE', f"{len(before)} particles")
+        bpy.ops.vgeo.restore_instances()
+        check("restoring particles", st.render_type == 'OBJECT' and len(own_instances(p_ground)) == 40)
+        for o in (gn_ground, p_ground):
+            bpy.data.objects.remove(o)
 
     # restore brings the source back
     proxy_uid = proxy.vgeo.uid

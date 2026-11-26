@@ -61,6 +61,12 @@ struct Prefetcher {
     }
 };
 
+// Per asset and level: the whole asset's triangles at that uniform level (local positions).
+struct LevelTris {
+    std::vector<float> pos;       // 9 floats per triangle
+    float error = 0.f;
+};
+
 struct Asset {
     // the file is memory-mapped (read into `owned` only if mapping fails): pages load on first
     // touch, so opening costs nothing and memory is bounded by what the cuts actually use
@@ -100,6 +106,21 @@ struct Asset {
     std::vector<int32_t> out_edges, out_corner_edge;
     std::vector<uint64_t> edge_keys;
     std::vector<int32_t> edge_ids;
+
+    // cut atoms (built on first use): the clusters sharing a (group, refined) pair. The cut
+    // rule tests only those two groups, so an atom's clusters are always selected together.
+    std::vector<vgeo_atom> atoms;
+    std::vector<uint32_t> atom_clusters;
+    std::vector<uint32_t> extract_ids;
+    // blocks: the atoms simplified from one parent group (2 or more), drawn as one piece when all of
+    // them are in a copy's cut. Unit ids: atoms 0..A-1, blocks A..A+B-1.
+    std::vector<vgeo_atom> blocks;      // cluster_offset/count index block_atoms
+    std::vector<uint32_t> block_atoms;
+    std::vector<int32_t> atom_block;    // per atom: its block, or -1
+
+    // occluders: the whole asset at a uniform level, built on first use per level
+    std::vector<LevelTris> level_cache;
+    std::vector<uint64_t> level_tri_counts;
 };
 
 // Unique edges of an indexed triangle list, Blender style.
@@ -404,19 +425,16 @@ extern "C" VGEO_API int vgeo_level_errors(void* handle, float* out, int max_leve
     return n;
 }
 
-extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out) {
-    Asset* a = static_cast<Asset*>(handle);
-    if (!a || !out || chunk >= a->h.chunk_count) return 1;
-    const vgeo2::Chunk& ch = a->chunks[chunk];
+namespace {
 
+// Extract clusters `ids` (checked ones only) as one indexed mesh with Blender-style edges.
+void extract_clusters(Asset* a, const uint32_t* ids, size_t n, vgeo_chunk_data* out) {
     a->out_pos.clear(); a->out_nrm.clear(); a->out_uv.clear();
     a->out_corner.clear(); a->out_mat.clear(); a->out_lod.clear();
 
     uint64_t corners = 0;
-    for (uint32_t k = 0; k < ch.cluster_count; ++k) {
-        uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
-        if (a->selected[id] && cluster_ok(*a, id)) corners += uint64_t(a->clusters[id].tri_count) * 3;
-    }
+    for (size_t k = 0; k < n; ++k)
+        if (cluster_ok(*a, ids[k])) corners += uint64_t(a->clusters[ids[k]].tri_count) * 3;
     size_t cap = 64;
     while (cap < corners * 2) cap <<= 1;   // load factor < 50% even if every corner is unique
     a->remap_key.assign(cap, ~0u);
@@ -424,9 +442,9 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     const size_t mask = cap - 1;
 
     int32_t next = 0;
-    for (uint32_t k = 0; k < ch.cluster_count; ++k) {
-        uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
-        if (!a->selected[id] || a->checked[id] != 1) continue;
+    for (size_t k = 0; k < n; ++k) {
+        uint32_t id = ids[k];
+        if (a->checked[id] != 1) continue;
         const vgeo2::Cluster& c = a->clusters[id];
         const uint32_t* idx = a->indices + c.index_offset;
         for (uint32_t t = 0; t < c.tri_count; ++t) {
@@ -444,7 +462,7 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
                 a->out_corner.push_back(a->remap_val[slot]);
             }
             a->out_mat.push_back(int32_t(a->vmat[idx[t * 3]]));
-            a->out_lod.push_back(int32_t(c.depth));
+            a->out_lod.push_back(int32_t((id << 6) | std::min<uint32_t>(c.depth, 63u)));  // debug views
         }
     }
     build_edges(*a, uint32_t(next));
@@ -459,6 +477,20 @@ extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_da
     out->corner_verts = a->out_corner.data();
     out->face_materials = a->out_mat.data();
     out->face_lod = a->out_lod.data();
+}
+
+}  // namespace
+
+extern "C" VGEO_API int vgeo_extract(void* handle, uint32_t chunk, vgeo_chunk_data* out) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !out || chunk >= a->h.chunk_count) return 1;
+    const vgeo2::Chunk& ch = a->chunks[chunk];
+    a->extract_ids.clear();
+    for (uint32_t k = 0; k < ch.cluster_count; ++k) {
+        uint32_t id = a->chunk_clusters[ch.cluster_offset + k];
+        if (a->selected[id]) a->extract_ids.push_back(id);
+    }
+    extract_clusters(a, a->extract_ids.data(), a->extract_ids.size(), out);
     return 0;
 }
 
@@ -512,7 +544,10 @@ extern "C" VGEO_API int vgeo_memory(void* handle, uint64_t* mapped_bytes, uint64
         + (a->out_pos.capacity() + a->out_nrm.capacity() + a->out_uv.capacity()) * 4
         + (a->out_corner.capacity() + a->out_mat.capacity() + a->out_lod.capacity()) * 4
         + (a->out_edges.capacity() + a->out_corner_edge.capacity() + a->edge_ids.capacity()) * 4
-        + a->edge_keys.capacity() * 8;
+        + a->edge_keys.capacity() * 8
+        + (a->atoms.capacity() + a->blocks.capacity()) * sizeof(vgeo_atom)
+        + (a->atom_clusters.capacity() + a->extract_ids.capacity() + a->block_atoms.capacity()
+           + a->atom_block.capacity()) * 4;
     if (mapped_bytes) *mapped_bytes = a->owned.size() ? 0 : a->size;
     if (heap_bytes) *heap_bytes = heap;
     return 0;
@@ -521,6 +556,705 @@ extern "C" VGEO_API int vgeo_memory(void* handle, uint64_t* mapped_bytes, uint64
 extern "C" VGEO_API int vgeo_corrupt(void* handle) {
     Asset* a = static_cast<Asset*>(handle);
     return a && a->corrupt ? 1 : 0;
+}
+
+// ---------------------------------------------------------------- occlusion culling
+
+namespace {
+
+inline void xform(const float* m, const float* p, float* out) {
+    for (int r = 0; r < 3; ++r) out[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+}
+
+
+// Linear view depth (distance along the view direction) per pixel of a small buffer; the occluders
+// are coarse levels of the nearest copies, pushed away from the camera by their simplification
+// error and eroded by a pixel, so the buffer only ever claims what the real surfaces hide.
+struct Occlusion {
+    int w = 0, h = 0;
+    float vp[16] = {};            // world -> clip, row-major
+    float cam[3] = {};
+    float near_w = 1e-3f;
+    std::vector<float> depth;     // w per pixel, +inf = nothing
+    std::vector<std::vector<float>> hiz;   // max-depth pyramid, level 0 = eroded depth
+    std::vector<int> hw, hh;
+    uint64_t triangles = 0;
+    bool ready = false;
+    uint64_t copy_tris = 6000;    // per copy at most (a coarser level is still a valid occluder)
+    bool erode = true;
+    bool push = true;
+};
+
+std::mutex g_level_mutex;
+
+const LevelTris& level_tris(Asset& a, int depth, std::vector<LevelTris>& cache) {
+    std::lock_guard<std::mutex> lock(g_level_mutex);
+    if (cache.empty()) cache.resize(std::max(1u, a.h.lod_levels));
+    depth = std::min<int>(depth, int(cache.size()) - 1);
+    LevelTris& L = cache[depth];
+    if (!L.pos.empty()) return L;
+    for (uint32_t i = 0; i < a.h.cluster_count; ++i) {
+        const vgeo2::Cluster& c = a.clusters[i];
+        bool terminal = !(a.groups[c.group].error < FLT_MAX);
+        bool sel = int(c.depth) == depth || (int(c.depth) < depth && terminal);
+        if (!sel || !cluster_ok(a, i)) continue;
+        if (c.refined >= 0 && a.groups[c.refined].error < FLT_MAX)
+            L.error = std::max(L.error, a.groups[c.refined].error);
+        const uint32_t* idx = a.indices + c.index_offset;
+        for (uint32_t t = 0; t < c.tri_count * 3; ++t) {
+            const float* p = a.positions + size_t(idx[t]) * 3;
+            L.pos.insert(L.pos.end(), p, p + 3);
+        }
+    }
+    if (L.pos.empty()) L.pos.push_back(0.f);   // never rebuilt
+    return L;
+}
+
+inline void to_clip(const float* m, const float* p, float* out) {
+    for (int r = 0; r < 4; ++r) out[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+}
+
+void raster_tri(Occlusion& O, const float* a, const float* b, const float* c) {
+    float ca[4], cb[4], cc[4];
+    to_clip(O.vp, a, ca);
+    to_clip(O.vp, b, cb);
+    to_clip(O.vp, c, cc);
+    if (ca[3] < O.near_w || cb[3] < O.near_w || cc[3] < O.near_w) return;   // crosses the near plane: skip
+    // screen positions (pixel units, y down irrelevant: tests use the same mapping) and 1/w
+    float sx[3], sy[3], iw[3];
+    const float* cs[3] = {ca, cb, cc};
+    for (int k = 0; k < 3; ++k) {
+        iw[k] = 1.f / cs[k][3];
+        sx[k] = (cs[k][0] * iw[k] * 0.5f + 0.5f) * O.w;
+        sy[k] = (cs[k][1] * iw[k] * 0.5f + 0.5f) * O.h;
+    }
+    float area = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+    if (std::fabs(area) < 1e-12f) return;
+    int x0 = std::max(0, int(std::floor(std::min({sx[0], sx[1], sx[2]}))));
+    int x1 = std::min(O.w - 1, int(std::ceil(std::max({sx[0], sx[1], sx[2]}))));
+    int y0 = std::max(0, int(std::floor(std::min({sy[0], sy[1], sy[2]}))));
+    int y1 = std::min(O.h - 1, int(std::ceil(std::max({sy[0], sy[1], sy[2]}))));
+    if (x0 > x1 || y0 > y1) return;
+    const float inv = 1.f / area;
+    for (int y = y0; y <= y1; ++y) {
+        const float py = y + 0.5f;
+        for (int x = x0; x <= x1; ++x) {
+            const float px = x + 0.5f;
+            float w0 = ((sx[1] - px) * (sy[2] - py) - (sx[2] - px) * (sy[1] - py)) * inv;
+            float w1 = ((sx[2] - px) * (sy[0] - py) - (sx[0] - px) * (sy[2] - py)) * inv;
+            float w2 = 1.f - w0 - w1;
+            if (w0 < 0.f || w1 < 0.f || w2 < 0.f) continue;
+            float d = 1.f / (w0 * iw[0] + w1 * iw[1] + w2 * iw[2]);   // perspective-correct view depth
+            float& dst = O.depth[size_t(y) * O.w + x];
+            if (d < dst) dst = d;
+        }
+    }
+}
+
+// Screen rect (pixels of level 0) and nearest view depth of a sphere; false if it reaches the camera
+// or leaves the screen in a way the rect cannot express (then it counts as visible).
+bool sphere_rect(const Occlusion& O, const float* c, float r, int& x0, int& y0, int& x1, int& y1, float& near_d) {
+    float lo_x = FLT_MAX, lo_y = FLT_MAX, hi_x = -FLT_MAX, hi_y = -FLT_MAX;
+    float cw[4];
+    to_clip(O.vp, c, cw);
+    // the view direction is the clip w row: distance along it of the sphere's nearest point
+    float wlen = std::sqrt(O.vp[12] * O.vp[12] + O.vp[13] * O.vp[13] + O.vp[14] * O.vp[14]);
+    near_d = cw[3] - r * wlen;
+    if (near_d < O.near_w) return false;
+    for (int k = 0; k < 8; ++k) {
+        float p[3] = {c[0] + ((k & 1) ? r : -r), c[1] + ((k & 2) ? r : -r), c[2] + ((k & 4) ? r : -r)};
+        float q[4];
+        to_clip(O.vp, p, q);
+        if (q[3] < O.near_w) return false;
+        float x = (q[0] / q[3] * 0.5f + 0.5f) * O.w, y = (q[1] / q[3] * 0.5f + 0.5f) * O.h;
+        lo_x = std::min(lo_x, x); hi_x = std::max(hi_x, x);
+        lo_y = std::min(lo_y, y); hi_y = std::max(hi_y, y);
+    }
+    x0 = std::max(0, int(std::floor(lo_x)));
+    y0 = std::max(0, int(std::floor(lo_y)));
+    x1 = std::min(O.w - 1, int(std::floor(hi_x)));
+    y1 = std::min(O.h - 1, int(std::floor(hi_y)));
+    return x0 <= x1 && y0 <= y1;   // entirely off screen: not this test's business
+}
+
+// True when every occluder pixel the sphere covers is nearer than the sphere's nearest point.
+bool sphere_occluded(const Occlusion& O, const float* c, float r) {
+    if (!O.ready) return false;
+    int x0, y0, x1, y1;
+    float near_d;
+    if (!sphere_rect(O, c, r, x0, y0, x1, y1, near_d)) return false;
+    // pick the pyramid level where the rect spans at most 4 texels a side
+    int lvl = 0;
+    while (lvl + 1 < int(O.hiz.size()) && ((x1 >> lvl) - (x0 >> lvl) > 3 || (y1 >> lvl) - (y0 >> lvl) > 3)) ++lvl;
+    const std::vector<float>& H = O.hiz[lvl];
+    const int W = O.hw[lvl];
+    for (int y = y0 >> lvl; y <= (y1 >> lvl); ++y)
+        for (int x = x0 >> lvl; x <= (x1 >> lvl); ++x)
+            if (!(H[size_t(y) * W + x] < near_d)) return false;
+    return true;
+}
+
+}  // namespace
+
+extern "C" VGEO_API void* vgeo_occlusion_new(int width, int height) {
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096) return nullptr;
+    Occlusion* O = new Occlusion();
+    O->w = width;
+    O->h = height;
+    O->depth.assign(size_t(width) * height, FLT_MAX);
+    return O;
+}
+
+extern "C" VGEO_API void vgeo_occlusion_free(void* occ) { delete static_cast<Occlusion*>(occ); }
+
+// Experiments: triangles per occluder copy (default 6000), erosion and error push (default on).
+extern "C" VGEO_API int vgeo_occlusion_config(void* occ, uint64_t copy_triangles, int erode, int push) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    if (!O) return 1;
+    if (copy_triangles) O->copy_tris = copy_triangles;
+    O->erode = erode != 0;
+    O->push = push != 0;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_occlusion_begin(void* occ, const float* view_proj, const float* camera, float znear) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    if (!O || !view_proj || !camera) return 1;
+    std::memcpy(O->vp, view_proj, sizeof(O->vp));
+    std::memcpy(O->cam, camera, sizeof(O->cam));
+    O->near_w = std::max(znear, 1e-6f);
+    std::fill(O->depth.begin(), O->depth.end(), FLT_MAX);
+    O->triangles = 0;
+    O->ready = false;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_occlusion_add(void* occ, void* handle, const float* transforms, const float* scales,
+                                           int count, float pixel_error, uint64_t max_triangles,
+                                           uint64_t* out_triangles) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    Asset* a = static_cast<Asset*>(handle);
+    if (!O || !a || (count > 0 && (!transforms || !scales))) return 1;
+    // errors per uniform level, coarsest that keeps a copy within pixel_error of the buffer
+    std::vector<float> errs(std::max(1u, a->h.lod_levels), 0.f);
+    vgeo_level_errors(a, errs.data(), int(errs.size()));
+    const float proj_h = std::sqrt(O->vp[4] * O->vp[4] + O->vp[5] * O->vp[5] + O->vp[6] * O->vp[6]);
+    float lo[3], hi[3], cl[3];
+    for (int d = 0; d < 3; ++d) {
+        lo[d] = a->h.aabb_min[d];
+        hi[d] = a->h.aabb_max[d];
+        cl[d] = 0.5f * (lo[d] + hi[d]);
+    }
+    float rl = 0.5f * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    const float wlen = std::sqrt(O->vp[12] * O->vp[12] + O->vp[13] * O->vp[13] + O->vp[14] * O->vp[14]);
+    {
+        std::lock_guard<std::mutex> lock(g_level_mutex);
+        if (a->level_tri_counts.empty()) {
+            a->level_tri_counts.assign(std::max(1u, a->h.lod_levels), 0);
+            for (uint32_t i = 0; i < a->h.cluster_count; ++i) {
+                const vgeo2::Cluster& c = a->clusters[i];
+                bool terminal = !(a->groups[c.group].error < FLT_MAX);
+                for (uint32_t L = 0; L < a->level_tri_counts.size(); ++L)
+                    if (c.depth == L || (c.depth < L && terminal)) a->level_tri_counts[L] += c.tri_count;
+            }
+        }
+    }
+    for (int i = 0; i < count && (max_triangles == 0 || O->triangles < max_triangles); ++i) {
+        const float* M = transforms + size_t(i) * 12;
+        const float s = scales[i];
+        float cw[3], q[4];
+        xform(M, cl, cw);
+        to_clip(O->vp, cw, q);
+        float dist = (q[3] - rl * s * wlen) / std::max(wlen, 1e-20f);
+        if (dist < O->near_w) dist = O->near_w;
+        // error in buffer pixels of level L: err * s / dist * proj_h * h / 2
+        int L = 0;
+        for (int k = int(errs.size()) - 1; k >= 0; --k)
+            if (errs[k] * s / dist * proj_h / std::max(wlen, 1e-20f) * O->h * 0.5f <= pixel_error) { L = k; break; }
+        // too heavy at the level its error allows: not an occluder (a coarser level could bulge
+        // sideways past the real silhouette, which pushing it back does not undo)
+        if (L < int(a->level_tri_counts.size()) && a->level_tri_counts[L] > O->copy_tris) continue;
+        const LevelTris& T = level_tris(*a, L, a->level_cache);
+        const float push = O->push ? T.error * s : 0.f;   // move each vertex away from the camera by the level's error
+        const size_t n = T.pos.size() / 9;
+        for (size_t t = 0; t < n; ++t) {
+            float v[3][3];
+            for (int k = 0; k < 3; ++k) {
+                xform(M, &T.pos[t * 9 + k * 3], v[k]);
+                if (push > 0.f) {
+                    float dx = v[k][0] - O->cam[0], dy = v[k][1] - O->cam[1], dz = v[k][2] - O->cam[2];
+                    float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (len > 0.f) {
+                        v[k][0] += dx / len * push; v[k][1] += dy / len * push; v[k][2] += dz / len * push;
+                    }
+                }
+            }
+            raster_tri(*O, v[0], v[1], v[2]);
+        }
+        O->triangles += n;
+    }
+    if (out_triangles) *out_triangles = O->triangles;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_occlusion_finish(void* occ) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    if (!O) return 1;
+    // erode the occluders by a pixel (3x3 max of depth): a pixel only counts as hidden when its
+    // neighbours are too, which covers partially covered edge pixels
+    O->hiz.clear(); O->hw.clear(); O->hh.clear();
+    std::vector<float> e(O->depth.size());
+    for (int y = 0; y < O->h; ++y)
+        for (int x = 0; x < O->w; ++x) {
+            float m = 0.f;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int xx = x + dx, yy = y + dy;
+                    if (!O->erode && (dx || dy)) continue;
+                    float d = (xx < 0 || yy < 0 || xx >= O->w || yy >= O->h) ? FLT_MAX : O->depth[size_t(yy) * O->w + xx];
+                    m = std::max(m, d);
+                }
+            e[size_t(y) * O->w + x] = m;
+        }
+    O->hiz.push_back(std::move(e)); O->hw.push_back(O->w); O->hh.push_back(O->h);
+    while (O->hw.back() > 1 || O->hh.back() > 1) {
+        const std::vector<float>& P = O->hiz.back();
+        int pw = O->hw.back(), ph = O->hh.back();
+        int nw = std::max(1, (pw + 1) / 2), nh = std::max(1, (ph + 1) / 2);
+        std::vector<float> N(size_t(nw) * nh);
+        for (int y = 0; y < nh; ++y)
+            for (int x = 0; x < nw; ++x) {
+                float m = 0.f;
+                for (int k = 0; k < 4; ++k) {
+                    int xx = std::min(pw - 1, x * 2 + (k & 1)), yy = std::min(ph - 1, y * 2 + (k >> 1));
+                    m = std::max(m, P[size_t(yy) * pw + xx]);
+                }
+                N[size_t(y) * nw + x] = m;
+            }
+        O->hiz.push_back(std::move(N)); O->hw.push_back(nw); O->hh.push_back(nh);
+    }
+    O->ready = true;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_occlusion_test(void* occ, const float* centers, const float* radii, int count,
+                                            uint8_t* out_occluded) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    if (!O || (count > 0 && (!centers || !radii || !out_occluded))) return 1;
+    for (int i = 0; i < count; ++i) out_occluded[i] = sphere_occluded(*O, centers + size_t(i) * 3, radii[i]) ? 1 : 0;
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_occlusion_depth(void* occ, float* out) {
+    Occlusion* O = static_cast<Occlusion*>(occ);
+    if (!O || !out) return 1;
+    const std::vector<float>& src = O->ready ? O->hiz[0] : O->depth;
+    std::copy(src.begin(), src.end(), out);
+    return 0;
+}
+
+// ---------------------------------------------------------------- cut atoms and many copies
+
+namespace {
+
+void build_atoms(Asset& a) {
+    if (!a.atoms.empty() || a.h.cluster_count == 0) return;
+    std::vector<uint32_t> order(a.h.cluster_count);
+    for (uint32_t i = 0; i < a.h.cluster_count; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+        const vgeo2::Cluster& cx = a.clusters[x];
+        const vgeo2::Cluster& cy = a.clusters[y];
+        return cx.group != cy.group ? cx.group < cy.group : cx.refined < cy.refined;
+    });
+    a.atom_clusters = order;
+    for (uint32_t k = 0; k < order.size();) {
+        const vgeo2::Cluster& first = a.clusters[order[k]];
+        uint32_t e = k;
+        while (e < order.size() && a.clusters[order[e]].group == first.group &&
+               a.clusters[order[e]].refined == first.refined)
+            ++e;
+        vgeo_atom at{};
+        at.group = first.group;
+        at.refined = first.refined;
+        at.cluster_offset = k;
+        at.cluster_count = e - k;
+        at.depth = first.depth;
+        // a sphere enclosing the clusters' spheres, centred on their bounding box
+        float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (uint32_t j = k; j < e; ++j) {
+            const vgeo2::Cluster& c = a.clusters[order[j]];
+            at.tri_count += c.tri_count;
+            for (int d = 0; d < 3; ++d) {
+                lo[d] = std::min(lo[d], c.center[d] - c.radius);
+                hi[d] = std::max(hi[d], c.center[d] + c.radius);
+            }
+        }
+        for (int d = 0; d < 3; ++d) at.center[d] = 0.5f * (lo[d] + hi[d]);
+        float r = 0.f;
+        for (uint32_t j = k; j < e; ++j) {
+            const vgeo2::Cluster& c = a.clusters[order[j]];
+            float dx = c.center[0] - at.center[0], dy = c.center[1] - at.center[1], dz = c.center[2] - at.center[2];
+            r = std::max(r, std::sqrt(dx * dx + dy * dy + dz * dz) + c.radius);
+        }
+        at.radius = r * 1.0001f + 1e-7f;
+        a.atoms.push_back(at);
+        k = e;
+    }
+    // blocks by parent group
+    const uint32_t na = uint32_t(a.atoms.size());
+    a.atom_block.assign(na, -1);
+    std::vector<uint32_t> by_parent(na);
+    for (uint32_t i = 0; i < na; ++i) by_parent[i] = i;
+    std::stable_sort(by_parent.begin(), by_parent.end(),
+                     [&](uint32_t x, uint32_t y) { return a.atoms[x].refined < a.atoms[y].refined; });
+    for (uint32_t k = 0; k < na;) {
+        const int32_t r = a.atoms[by_parent[k]].refined;
+        uint32_t e = k;
+        while (e < na && a.atoms[by_parent[e]].refined == r) ++e;
+        if (r >= 0 && e - k >= 2) {
+            vgeo_atom b{};
+            b.group = -1;
+            b.refined = r;
+            b.cluster_offset = uint32_t(a.block_atoms.size());
+            b.cluster_count = e - k;
+            b.depth = a.atoms[by_parent[k]].depth;
+            float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+            for (uint32_t j = k; j < e; ++j) {
+                const vgeo_atom& at = a.atoms[by_parent[j]];
+                a.block_atoms.push_back(by_parent[j]);
+                a.atom_block[by_parent[j]] = int32_t(a.blocks.size());
+                b.tri_count += at.tri_count;
+                b.depth = std::min(b.depth, at.depth);
+                for (int d = 0; d < 3; ++d) {
+                    lo[d] = std::min(lo[d], at.center[d] - at.radius);
+                    hi[d] = std::max(hi[d], at.center[d] + at.radius);
+                }
+            }
+            for (int d = 0; d < 3; ++d) b.center[d] = 0.5f * (lo[d] + hi[d]);
+            float rad = 0.f;
+            for (uint32_t j = k; j < e; ++j) {
+                const vgeo_atom& at = a.atoms[by_parent[j]];
+                float dx = at.center[0] - b.center[0], dy = at.center[1] - b.center[1], dz = at.center[2] - b.center[2];
+                rad = std::max(rad, std::sqrt(dx * dx + dy * dy + dz * dz) + at.radius);
+            }
+            b.radius = rad * 1.0001f + 1e-7f;
+            a.blocks.push_back(b);
+        }
+        k = e;
+    }
+}
+
+inline bool inside_any(const vgeo_view* views, int n, const float* c, float r) {
+    for (int i = 0; i < n; ++i)
+        if (in_frustum(views[i], c, r)) return true;
+    return false;
+}
+
+// Can the shadow of a sphere (c, r), part of a copy of radius copy_r, reach any view?
+bool shadow_reaches(const vgeo_view* views, int nv, const vgeo_shadow_light* lights, int nl,
+                    const float* c, float r, float copy_r) {
+    for (int l = 0; l < nl; ++l) {
+        const vgeo_shadow_light& L = lights[l];
+        for (int i = 0; i < nv; ++i) {
+            const vgeo_view& v = views[i];
+            if (L.kind == 0) {
+                // the sphere swept along the light by `reach` must not lie fully outside one plane
+                float reach = L.reach > 0.f ? L.reach : 2.f * copy_r / std::max(-L.dir[2], 0.1f);
+                bool hit = true;
+                for (int p = 0; p < 6 && hit; ++p) {
+                    float d = v.planes[p][0] * c[0] + v.planes[p][1] * c[1] + v.planes[p][2] * c[2] + v.planes[p][3];
+                    float nd = v.planes[p][0] * L.dir[0] + v.planes[p][1] * L.dir[1] + v.planes[p][2] * L.dir[2];
+                    if (d + reach * std::max(nd, 0.f) < -r) hit = false;
+                }
+                if (hit) return true;
+            } else {
+                if (!in_frustum(v, L.pos, L.range)) continue;   // its light never reaches this view
+                float dx = c[0] - L.pos[0], dy = c[1] - L.pos[1], dz = c[2] - L.pos[2];
+                float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist - r > L.range) continue;
+                if (L.half_angle < 1.5707964f && dist > r) {
+                    float cosang = (dx * L.axis[0] + dy * L.axis[1] + dz * L.axis[2]) / dist;
+                    float ang = std::acos(std::min(1.f, std::max(-1.f, cosang))) - std::asin(std::min(1.f, r / dist));
+                    if (ang > L.half_angle) continue;
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct InstanceJob {
+    const Asset* a;
+    const vgeo_view* views;
+    int nv;
+    const float* transforms;
+    const float* scales;
+    const uint8_t* mask;
+    int mode;
+    float offscreen_scale;
+    const vgeo_shadow_light* lights;
+    int nl;
+    float local_center[3];
+    float local_radius;
+    const Occlusion* occ;
+    bool blocks;
+};
+
+// Shadows mode: may an occluded sphere still shadow something visible? Each sun's shadow volume
+// (the sphere swept along the light by its reach) must be occluded too; a point or spot lamp keeps it
+// when in range (its shadow can fall anywhere around it).
+bool shadow_unoccluded(const InstanceJob& J, const float* c, float r, float copy_r) {
+    for (int l = 0; l < J.nl; ++l) {
+        const vgeo_shadow_light& L = J.lights[l];
+        if (L.kind == 0) {
+            float reach = L.reach > 0.f ? L.reach : 2.f * copy_r / std::max(-L.dir[2], 0.1f);
+            float sc[3] = {c[0] + L.dir[0] * reach * 0.5f, c[1] + L.dir[1] * reach * 0.5f,
+                           c[2] + L.dir[2] * reach * 0.5f};
+            if (!sphere_occluded(*J.occ, sc, r + reach * 0.5f)) return true;
+        } else {
+            float dx = c[0] - L.pos[0], dy = c[1] - L.pos[1], dz = c[2] - L.pos[2];
+            if (std::sqrt(dx * dx + dy * dy + dz * dz) - r <= L.range) return true;
+        }
+    }
+    return false;
+}
+
+void select_range(const InstanceJob& J, int lo, int hi, std::vector<uint32_t>& pairs, uint64_t& tris,
+                  uint32_t& drawn) {
+    const Asset& a = *J.a;
+    const int G = int(a.h.group_count);
+    std::vector<uint8_t> pass(static_cast<size_t>(G));
+    const bool use_blocks = J.blocks && !a.blocks.empty();
+    std::vector<uint32_t> inc;                                   // atoms in this copy's cut
+    std::vector<uint32_t> bcount(use_blocks ? a.blocks.size() : 0, 0);
+    const bool cull = J.mode == VGEO_OFFSCREEN_CULL || J.mode == VGEO_OFFSCREEN_SHADOWS;
+    const bool coarsen = (J.mode == VGEO_OFFSCREEN_COARSEN || J.mode == VGEO_OFFSCREEN_SHADOWS) &&
+                         J.offscreen_scale > 1.f;
+    const bool shadows = J.mode == VGEO_OFFSCREEN_SHADOWS && J.nl > 0;
+    for (int i = lo; i < hi; ++i) {
+        if (J.mask && !J.mask[i]) continue;
+        const float* M = J.transforms + size_t(i) * 12;
+        const float s = J.scales[i];
+        float cc[3];
+        xform(M, J.local_center, cc);
+        const float cr = J.local_radius * s;
+        if (cull && !inside_any(J.views, J.nv, cc, cr) &&
+            !(shadows && shadow_reaches(J.views, J.nv, J.lights, J.nl, cc, cr, cr)))
+            continue;
+        // occlusion (one view): a hidden copy is dropped (Cull), kept coarsened when its shadow may
+        // still show (Shadows), or coarsened (Coarsen)
+        const bool hidden = J.occ && sphere_occluded(*J.occ, cc, cr);
+        if (hidden && J.mode == VGEO_OFFSCREEN_CULL) continue;
+        if (hidden && J.mode == VGEO_OFFSCREEN_SHADOWS && !shadow_unoccluded(J, cc, cr, cr)) continue;
+        // a copy entirely inside a view has every group and atom inside it too (their spheres
+        // contain geometry, which lies in the copy's sphere): no per-group or per-atom frustum test
+        uint32_t fully_inside = 0;   // bit per view (first 32)
+        for (int v = 0; v < J.nv && v < 32; ++v) {
+            bool all = true;
+            for (int p = 0; p < 6 && all; ++p) {
+                const float* pl = J.views[v].planes[p];
+                if (pl[0] * cc[0] + pl[1] * cc[1] + pl[2] * cc[2] + pl[3] < cr) all = false;
+            }
+            if (all) fully_inside |= 1u << v;
+        }
+        for (int g = 0; g < G; ++g) {
+            const vgeo2::Group& gr = a.groups[g];
+            if (!(gr.error < FLT_MAX)) { pass[g] = 0; continue; }
+            float wc[3];
+            xform(M, gr.center, wc);
+            const float wr = gr.radius * s, werr = gr.error * s;
+            bool ok = true;
+            for (int v = 0; v < J.nv && ok; ++v) {
+                const vgeo_view& vw = J.views[v];
+                float e;
+                if (vw.ortho) {
+                    e = werr / std::max(vw.ortho_height, 1e-20f);
+                } else {
+                    float dx = wc[0] - vw.camera[0], dy = wc[1] - vw.camera[1], dz = wc[2] - vw.camera[2];
+                    float d = std::sqrt(dx * dx + dy * dy + dz * dz) - wr;
+                    e = werr / std::max(d, vw.znear) * (vw.proj * 0.5f);
+                }
+                float t = vw.threshold;
+                if (hidden && J.offscreen_scale > 1.f)
+                    t *= J.offscreen_scale;
+                else if (coarsen && !(v < 32 && (fully_inside >> v) & 1u) && !in_frustum(vw, wc, wr))
+                    t *= J.offscreen_scale;
+                if (e > t) ok = false;
+            }
+            pass[g] = ok ? 1 : 0;
+        }
+        bool any = false;
+        const uint32_t na = uint32_t(a.atoms.size());
+        for (uint32_t k = 0; k < na; ++k) {
+            const vgeo_atom& at = a.atoms[k];
+            if (pass[at.group] || (at.refined >= 0 && !pass[at.refined])) continue;
+            if (cull && !fully_inside) {
+                float wc[3];
+                xform(M, at.center, wc);
+                const float wr = at.radius * s;
+                if (!inside_any(J.views, J.nv, wc, wr) &&
+                    !(shadows && shadow_reaches(J.views, J.nv, J.lights, J.nl, wc, wr, cr)))
+                    continue;
+            }
+            if (cull && J.occ && !hidden) {
+                float wc[3];
+                xform(M, at.center, wc);
+                const float wr = at.radius * s;
+                if (sphere_occluded(*J.occ, wc, wr) && !(shadows && shadow_unoccluded(J, wc, wr, cr))) continue;
+            }
+            if (use_blocks) {
+                inc.push_back(k);
+                if (a.atom_block[k] >= 0) ++bcount[a.atom_block[k]];
+                continue;
+            }
+            pairs.push_back(uint32_t(i));
+            pairs.push_back(k);
+            tris += at.tri_count;
+            any = true;
+        }
+        if (use_blocks) {
+            // a block whose atoms are all in the cut is drawn as one piece
+            const uint32_t A = na;
+            for (uint32_t k : inc) {
+                const int32_t b = a.atom_block[k];
+                if (b >= 0 && bcount[b] == a.blocks[b].cluster_count) {
+                    pairs.push_back(uint32_t(i));
+                    pairs.push_back(A + uint32_t(b));
+                    tris += a.blocks[b].tri_count;
+                    bcount[b] = 0xFFFFFFFFu;   // emitted
+                } else if (b < 0 || bcount[b] != 0xFFFFFFFFu) {
+                    pairs.push_back(uint32_t(i));
+                    pairs.push_back(k);
+                    tris += a.atoms[k].tri_count;
+                }
+            }
+            for (uint32_t k : inc)
+                if (a.atom_block[k] >= 0) bcount[a.atom_block[k]] = 0;
+            any = !inc.empty();
+            inc.clear();
+        }
+        if (any) ++drawn;
+    }
+}
+
+}  // namespace
+
+extern "C" VGEO_API int vgeo_atoms(void* handle, vgeo_atom* out, int max_atoms) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a) return -1;
+    build_atoms(*a);
+    const int n = int(a->atoms.size());
+    if (out && max_atoms > 0) std::copy(a->atoms.begin(), a->atoms.begin() + std::min(n, max_atoms), out);
+    return n;
+}
+
+extern "C" VGEO_API int vgeo_extract_atom(void* handle, uint32_t atom, vgeo_chunk_data* out) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !out) return 1;
+    build_atoms(*a);
+    const uint32_t A = uint32_t(a->atoms.size());
+    if (atom < A) {
+        const vgeo_atom& at = a->atoms[atom];
+        extract_clusters(a, a->atom_clusters.data() + at.cluster_offset, at.cluster_count, out);
+        return 0;
+    }
+    if (atom - A >= a->blocks.size()) return 1;
+    const vgeo_atom& b = a->blocks[atom - A];
+    a->extract_ids.clear();
+    for (uint32_t j = 0; j < b.cluster_count; ++j) {
+        const vgeo_atom& at = a->atoms[a->block_atoms[b.cluster_offset + j]];
+        a->extract_ids.insert(a->extract_ids.end(), a->atom_clusters.begin() + at.cluster_offset,
+                              a->atom_clusters.begin() + at.cluster_offset + at.cluster_count);
+    }
+    std::vector<uint32_t> ids(a->extract_ids);   // extract_clusters does not use extract_ids, but be safe
+    extract_clusters(a, ids.data(), ids.size(), out);
+    return 0;
+}
+
+extern "C" VGEO_API int vgeo_blocks(void* handle, vgeo_atom* out, int max_blocks) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a) return -1;
+    build_atoms(*a);
+    const int n = int(a->blocks.size());
+    if (out && max_blocks > 0) std::copy(a->blocks.begin(), a->blocks.begin() + std::min(n, max_blocks), out);
+    return n;
+}
+
+extern "C" VGEO_API int vgeo_select_instances(void* handle, const vgeo_view* views, int view_count,
+                                              const float* transforms, const float* scales,
+                                              const uint8_t* copy_mask, int copy_count, int mode,
+                                              float offscreen_scale, const vgeo_shadow_light* lights,
+                                              int light_count, const void* occlusion, int flags,
+                                              uint32_t* out_pairs, uint32_t max_pairs,
+                                              vgeo_instances_stats* stats) {
+    Asset* a = static_cast<Asset*>(handle);
+    if (!a || !views || view_count <= 0 || copy_count < 0 || (copy_count > 0 && (!transforms || !scales)))
+        return 1;
+    build_atoms(*a);
+    InstanceJob J{};
+    J.a = a;
+    J.views = views;
+    J.nv = view_count;
+    J.transforms = transforms;
+    J.scales = scales;
+    J.mask = copy_mask;
+    J.mode = mode;
+    J.offscreen_scale = offscreen_scale;
+    J.lights = lights;
+    J.nl = lights ? light_count : 0;
+    J.blocks = (flags & VGEO_SELECT_BLOCKS) != 0;
+    J.occ = (occlusion && static_cast<const Occlusion*>(occlusion)->ready && view_count == 1)
+                ? static_cast<const Occlusion*>(occlusion) : nullptr;
+    float r2 = 0.f;
+    for (int d = 0; d < 3; ++d) {
+        J.local_center[d] = 0.5f * (a->h.aabb_min[d] + a->h.aabb_max[d]);
+        float h = 0.5f * (a->h.aabb_max[d] - a->h.aabb_min[d]);
+        r2 += h * h;
+    }
+    J.local_radius = std::sqrt(r2) * 1.0001f;
+
+    // copies split over threads; each fills its own list, joined in copy order
+    unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    int threads = int(std::min<unsigned>(hw, 16u));
+    const uint64_t work = uint64_t(copy_count) * (a->h.group_count + a->atoms.size());
+    if (work < 200000) threads = 1;
+    threads = std::max(1, std::min(threads, copy_count));
+    std::vector<std::vector<uint32_t>> pairs(static_cast<size_t>(threads));
+    std::vector<uint64_t> tris(static_cast<size_t>(threads), 0);
+    std::vector<uint32_t> drawn(static_cast<size_t>(threads), 0);
+    if (threads == 1) {
+        select_range(J, 0, copy_count, pairs[0], tris[0], drawn[0]);
+    } else {
+        std::vector<std::thread> pool;
+        for (int t = 0; t < threads; ++t) {
+            int lo = int(int64_t(copy_count) * t / threads), hi = int(int64_t(copy_count) * (t + 1) / threads);
+            pool.emplace_back([&, t, lo, hi] { select_range(J, lo, hi, pairs[t], tris[t], drawn[t]); });
+        }
+        for (auto& th : pool) th.join();
+    }
+    uint64_t total_pairs = 0, total_tris = 0;
+    uint32_t total_drawn = 0;
+    for (int t = 0; t < threads; ++t) {
+        total_pairs += pairs[t].size() / 2;
+        total_tris += tris[t];
+        total_drawn += drawn[t];
+    }
+    if (out_pairs) {
+        uint64_t at = 0;
+        for (int t = 0; t < threads && at < max_pairs; ++t) {
+            uint64_t n = std::min<uint64_t>(pairs[t].size() / 2, max_pairs - at);
+            if (n) std::memcpy(out_pairs + at * 2, pairs[t].data(), size_t(n) * 8);
+            at += n;
+        }
+    }
+    if (stats) {
+        stats->triangles = total_tris;
+        stats->pairs = uint32_t(std::min<uint64_t>(total_pairs, 0xFFFFFFFFu));
+        stats->copies_drawn = total_drawn;
+    }
+    return (out_pairs && total_pairs > max_pairs) ? 2 : 0;
 }
 
 // ---------------------------------------------------------------- web export
