@@ -102,18 +102,20 @@ change every frame.
       shadow can reach the view), Cull. Pixel-identical to Coarsen in the
       shadow check (`docs/images/offscreen_modes.jpg`).
 - [x] `examples/statue_avenue`: the film's scene as a reproducible benchmark.
-- [ ] Memory growth over long renders: render 100 frames of the statue avenue
-      in one session with EEVEE (GPU) and Cycles, log RSS per frame, and find
-      what holds memory (chunk meshes of released streamed copies, back
-      buffers, mesh datablocks left with zero users, EEVEE caches). Done when
-      T3 holds.
+- [x] Memory growth over long renders: `tools/render_memory_bench.py`, 100
+      frames of the statue avenue in one session, EEVEE and Cycles on a GPU.
+      Memory warms up over the first ~50 frames, then stays flat (second half
+      -7.6 % to +1.7 %); frozen runs separate the add-on from the engine. The
+      film's per-frame growth was EEVEE's software-GL path. T3 holds on a GPU.
 - [ ] Viewport check of the new modes on a GPU (`tests/viewport_bench.py`),
       Solid and EEVEE, flying through the statue avenue. Record fps and worst
       frame before and after.
-- [ ] Decide the default Off-screen mode for new instancers (Sun Shadows is
-      the candidate; existing files keep Coarsen).
-- [ ] Sun Shadows: cache the sun list per tick, and keep copies within range
-      of shadow-casting point and spot lights (sphere against light radius).
+- [x] New instancers (Scatter, `create_instancer`) use Shadows; the property
+      default stays Coarsen, so existing files render what they did.
+- [x] Shadows mode (was Sun Shadows): lamps scanned once per tick; copies
+      within reach of a shadow-casting point or spot lamp whose light reaches
+      the view are kept (custom distance, else EEVEE's influence radius; spot
+      cone tested).
 
 ## Phase 2: a meshlet cut on every copy
 
