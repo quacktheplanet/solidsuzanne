@@ -179,8 +179,9 @@ Measured on the statue avenue and the synthetic field (RTX A4500, Blender 5.1.2)
 - Mitigation 2, an instance budget: EEVEE pays ~2 us per instance per frame.
   In the viewport an instancer draws at most 8,000 instances: copies start as
   one whole level mesh and switch to their atoms in order of triangles saved
-  per extra instance (synthetic field, EEVEE flying: 17.7 fps atoms only, 43.5
-  fps with the budget).
+  per extra instance, when each extra instance saves at least 1,000 triangles
+  (synthetic field, EEVEE flying at 2100x1341: 17.7 fps atoms only, 43.5 fps
+  with the budget; at 1048x683, 71.9 fps with the minimum gain).
 - Parent-merged blocks would cut instances by another 33-40 % at no triangle
   cost (not built yet).
 
@@ -230,10 +231,14 @@ At a 1280x800 window (1048x683 region, about the bench's 720p), with blocks
 | Statue avenue, atoms | 64.2 fps | 36.3 fps (75 ms) | 53.7 fps |
 | Synthetic field, today | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
 | Synthetic field, atoms | 93.2 fps | 45.1 fps (44 ms) | 52.8 fps |
+| Statue avenue, atoms, min gain 1,000 | 63.5 fps | 38.5 fps (79 ms) | 57.6 fps |
+| Synthetic field, atoms, min gain 1,000 | 114.5 fps | 71.9 fps (39 ms) | 81.6 fps |
 
-T2 holds at this size on both scenes. Open: the synthetic field's still EEVEE
-frame is slower than today's (8k instances cost more than the triangles they
-save in a small viewport); an adaptive budget would fix it.
+With the instance budget alone, the synthetic field's still EEVEE frame was
+slower than today's (8k instances cost more than the triangles they saved in a
+small viewport). A copy now also switches to atoms only when each extra
+instance saves at least 1,000 triangles: T2 holds on both scenes, and no mode
+is slower than today.
 
 Run-to-run spread of EEVEE numbers on this remote machine is about 20 %. The
 synthetic field first ran with a fixed 300-triangle cost per instance (29.5

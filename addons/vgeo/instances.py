@@ -929,6 +929,8 @@ ATOM_MOVING_INTERVAL = float(os.environ.get("VGEO_ATOM_INTERVAL", 0.2))   # seco
 # viewport has an instance budget per instancer: every drawn copy starts as one whole level mesh, and
 # copies switch to their atoms in order of triangles saved per extra instance while the budget lasts.
 INSTANCE_BUDGET = int(os.environ.get("VGEO_INSTANCE_BUDGET", 8000))
+# ...and a copy switches only if each extra instance saves at least this many triangles
+MIN_GAIN = float(os.environ.get("VGEO_MIN_GAIN", 1000))
 
 _atom_assets = {}   # instancer uid -> native.Asset (own handle, memory-mapped)
 _atom_state = {}    # (instancer uid, slice) -> last pairs written to that cloud
@@ -1295,7 +1297,7 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
     n = len(inst.data.vertices)
     levels = np.full(n, -1, np.int32)   # copies drawn as atoms show no level mesh
     tris = int(st.triangles)
-    if paced and INSTANCE_BUDGET > 0 and len(pairs) > INSTANCE_BUDGET:
+    if paced and INSTANCE_BUDGET > 0 and len(pairs):
         # viewport over budget: some copies are drawn as one whole level mesh instead of their atoms
         # (final renders always draw atoms: fewer triangles, and renderers cope with the instances)
         atom_tris = np.asarray(inst.get("vgeo_atom_tris", []), np.int64)
@@ -1312,7 +1314,7 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
             base = int(a_count[~use_level].sum() + use_level.sum())
             extra = (a_count - 1).astype(np.float64)
             gain = (l_tris - a_tris).astype(np.float64)
-            cand = np.nonzero(use_level & (gain > 0))[0]
+            cand = np.nonzero(use_level & (gain > 0) & (gain >= MIN_GAIN * extra))[0]
             order = cand[np.argsort(-gain[cand] / extra[cand], kind="stable")]
             fits = np.cumsum(extra[order]) <= max(0, INSTANCE_BUDGET - base)
             use_level[order[fits]] = False
