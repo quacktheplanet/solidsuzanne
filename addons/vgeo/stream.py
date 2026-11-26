@@ -545,10 +545,12 @@ def fill_mesh(me, data, materials, lod_colors):
     if len(materials) > 1:
         _set_attr(me, "material_index", 'INT', 'FACE', "value", data["face_materials"])
     if lod_colors:
-        lod = np.repeat(data["face_lod"] % len(LOD_PALETTE), 3)
+        lod = np.repeat((data["face_lod"] & 63) % len(LOD_PALETTE), 3)
         col = _set_attr(me, "vgeo_lod", 'FLOAT_COLOR', 'CORNER', "color",
                         np.ascontiguousarray(LOD_PALETTE[lod]).ravel())
         me.color_attributes.active_color = col
+    from . import debug
+    debug.write_viz(me, data)
     me.update()
 
 
@@ -970,6 +972,9 @@ def _on_render_done(scene, depsgraph=None):
 @persistent
 def _on_load(_a=None, _b=None):
     invalidate_all(close=True)
+    from . import debug
+    debug.mode = getattr(bpy.context.scene, "vgeo_debug", 'NONE') if bpy.context.scene else 'NONE'
+
     from . import instances
     instances.close_atom_assets()
 

@@ -122,7 +122,7 @@ typedef struct vgeo_chunk_data {
     const float* uvs;             // vertex_count * 2 (NULL if absent)
     const int32_t* corner_verts;  // tri_count * 3
     const int32_t* face_materials;// tri_count
-    const int32_t* face_lod;      // tri_count, DAG depth (for debug views)
+    const int32_t* face_lod;      // tri_count, (cluster << 6) | DAG depth (for debug views)
     // Blender-style edges: unique vertex pairs, and per corner the edge from
     // that corner to the next corner of its triangle
     uint32_t edge_count;

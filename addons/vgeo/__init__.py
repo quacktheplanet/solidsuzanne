@@ -18,7 +18,7 @@ bl_info = {
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-from . import build, instances, native, scatter, stream
+from . import build, debug, instances, native, scatter, stream
 
 
 def _invalidate(self, _context):
@@ -355,6 +355,9 @@ class VGEO_PT_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        row = layout.row(align=True)
+        row.prop(context.scene, "vgeo_debug", text="")
+        row.prop(context.scene, "vgeo_stats", text="", icon='INFO')
         ob = context.active_object
         if not native.available():
             layout.label(text="Native library missing", icon='ERROR')
@@ -502,11 +505,13 @@ def register():
     bpy.types.Object.vgeo = PointerProperty(type=VGEOObjectSettings)
     bpy.types.Object.vgeo_inst = PointerProperty(type=VGEOInstanceSettings)
     bpy.types.VIEW3D_MT_object.append(_menu)
+    debug.register()
     stream.register()
 
 
 def unregister():
     stream.unregister()
+    debug.unregister()
     bpy.types.VIEW3D_MT_object.remove(_menu)
     del bpy.types.Object.vgeo_inst
     del bpy.types.Object.vgeo

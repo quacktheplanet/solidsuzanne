@@ -972,6 +972,39 @@ def run():
     linked += [sc.name for sc in bpy.data.scenes if gcol.name in sc.collection.children]
     check("deleted proxy's chunks are unlinked", not linked, str(linked))
 
+    # ---- debug views: every mesh VGEO writes carries vgeo_viz while one is on
+    from vgeo import debug as vdebug
+    scene = bpy.context.scene
+    proxy.vgeo.path = good   # the missing-file test above pointed it elsewhere
+    camera((0, -8, 0.2))
+    view = stream.camera_view(scene)
+    scene.vgeo_debug = 'MESHLETS'
+    rt = stream.apply_cut(proxy, [view], 1.0, force=True)
+    viz = [o.data.color_attributes.get("vgeo_viz") for o in stream.fronts(proxy) if len(o.data.polygons)]
+    cols = set()
+    for a in viz:
+        if a is not None:
+            c = np.empty(len(a.data) * 4, np.float32)
+            a.data.foreach_get("color", c)
+            cols.update(map(tuple, np.round(c.reshape(-1, 4)[::3, :3], 2)))
+    lvl_viz = all(o.data.color_attributes.get("vgeo_viz") is not None
+                  for i in instances.instancers(scene) for o in i.vgeo_inst.levels.objects if len(o.data.polygons))
+    check("Meshlets debug view colors each cluster", viz and all(a is not None for a in viz)
+          and len(cols) >= 0.5 * rt.clusters and lvl_viz, f"{len(cols)} colors, {rt.clusters} clusters")
+    scene.vgeo_debug = 'LOD'
+    stream.apply_cut(proxy, [view], 1.0, force=True)
+    a = next(o.data.color_attributes.get("vgeo_viz") for o in stream.fronts(proxy) if len(o.data.polygons))
+    c = np.empty(len(a.data) * 4, np.float32)
+    a.data.foreach_get("color", c)
+    alpha = set(np.round(c.reshape(-1, 4)[:, 3] * 16).astype(int).tolist())
+    check("LOD debug view: alpha holds the depth", a is not None and len(alpha) >= 1 and max(alpha) <= 16, str(alpha))
+    scene.vgeo_debug = 'NONE'
+    stream.apply_cut(proxy, [view], 1.0, force=True)
+    check("debug view off removes the colors",
+          all(o.data.color_attributes.get("vgeo_viz") is None for o in stream.fronts(proxy)))
+    st = vdebug.scene_stats(scene)
+    check("stats overlay counts the scene", st["source"] > st["drawn"] > 0, str(st))
+
     # ---- Virtualize Instances: an existing scatter handed to VGEO instancers
     from vgeo import scatter as vscatter
     proxy.vgeo.path = good   # the missing-file test above pointed it elsewhere

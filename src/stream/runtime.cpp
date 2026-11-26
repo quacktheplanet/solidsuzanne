@@ -462,7 +462,7 @@ void extract_clusters(Asset* a, const uint32_t* ids, size_t n, vgeo_chunk_data* 
                 a->out_corner.push_back(a->remap_val[slot]);
             }
             a->out_mat.push_back(int32_t(a->vmat[idx[t * 3]]));
-            a->out_lod.push_back(int32_t(c.depth));
+            a->out_lod.push_back(int32_t((id << 6) | std::min<uint32_t>(c.depth, 63u)));  // debug views
         }
     }
     build_edges(*a, uint32_t(next));
