@@ -36,17 +36,33 @@ inside its own engine.
 How it works and every measurement: [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
 Where it is going: [docs/ROADMAP.md](docs/ROADMAP.md).
 
-## Quick start
+## Install
+
+Download `vgeo-<version>.zip` from the releases, then in Blender 5.1 or newer:
+**Edit > Preferences > Get Extensions > (menu) Install from Disk**. Windows for now;
+macOS and Linux builds are on the roadmap.
+
+Save your .blend, select a dense mesh and run **Object > Virtualize Mesh**. Then:
+
+- **Scatter Instances** (the VGEO sidebar tab) scatters copies over another selected mesh, or
+  **Object > Virtualize Instances** takes over an existing Geometry Nodes, particle or
+  collection-instance scatter of a virtualized mesh.
+- The **VGEO** sidebar tab has the error budgets, Off-screen modes, the debug views and the stats
+  overlay.
+
+Assets are written to a `vgeo` folder next to the .blend; keep it with the file (if it goes
+missing, the panel's **Find Missing Assets** relinks it).
+
+## Build from source
 
 ```
-cmake -S . -B build-stream -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGEO_STREAM_ONLY=ON
+cmake -S . -B build-stream -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-stream
+python tools/package_addon.py          # -> dist/vgeo-<version>.zip (Blender's extension build + validate)
 ```
 
-Needs a C++20 compiler (no Vulkan SDK, no Python headers); the library lands in
-`addons/vgeo/bin/`. Install `addons/vgeo` as an add-on (or zip it with
-`tools/package_addon.py`), save your .blend, select a mesh and run
-**Object > Virtualize Mesh**. The VGEO sidebar tab has everything else.
+Needs CMake 3.20+ and a C++20 compiler (meshoptimizer is fetched at a pinned commit); the native
+library lands in `addons/vgeo/bin/`, so `addons/vgeo` also works as a development add-on.
 
 Tests and benchmarks (Blender 5.1):
 
