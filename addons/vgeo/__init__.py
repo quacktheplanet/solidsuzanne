@@ -15,6 +15,8 @@ bl_info = {
     "category": "Object",
 }
 
+import os
+
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
@@ -404,7 +406,12 @@ class VGEO_PT_panel(bpy.types.Panel):
         rt = stream._runtimes.get(v.uid)
         box = layout.box()
         if rt is None or rt.asset is None:
-            box.label(text=(rt.error if rt else "Waiting for first update"), icon='INFO')
+            if rt is not None and rt.error:
+                box.label(text="Asset file not found:", icon='ERROR')
+                box.label(text=bpy.path.abspath(v.path))
+                box.operator(VGEO_OT_find_missing.bl_idname, icon='VIEWZOOM')
+            else:
+                box.label(text="Waiting for first update", icon='INFO')
         else:
             src = rt.asset.info["source_triangles"]
             col = box.column(align=True)
@@ -431,6 +438,59 @@ class VGEO_PT_panel(bpy.types.Panel):
         row.operator(VGEO_OT_restore.bl_idname, icon='LOOP_BACK')
         layout.operator(VGEO_OT_export_web.bl_idname, icon='WORLD')
         layout.operator(VGEO_OT_scatter.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
+
+
+def missing_assets():
+    """Proxies whose .vgeo file is not where they point."""
+    return [o for o in bpy.data.objects if o.vgeo.uid and o.vgeo.path and o.library is None
+            and not os.path.exists(bpy.path.abspath(o.vgeo.path))]
+
+
+def find_missing_assets(folder):
+    """Point every proxy with a missing .vgeo at a file of the same name under folder (searched
+    recursively). Returns (found, still missing)."""
+    files = {}
+    for root, _dirs, names in os.walk(folder):
+        for n in names:
+            if n.lower().endswith(".vgeo"):
+                files.setdefault(n.lower(), os.path.join(root, n))
+    found, missing = 0, 0
+    for ob in missing_assets():
+        hit = files.get(os.path.basename(bpy.path.abspath(ob.vgeo.path)).lower())
+        if hit is None:
+            missing += 1
+            continue
+        try:
+            ob.vgeo.path = bpy.path.relpath(hit) if bpy.data.filepath else hit
+        except ValueError:   # another drive: no relative path
+            ob.vgeo.path = hit
+        found += 1
+    if found:
+        stream.invalidate_all(close=True)
+        instances.close_atom_assets()
+    return found, missing
+
+
+class VGEO_OT_find_missing(bpy.types.Operator):
+    """Look for missing VGEO asset files (.vgeo) in a folder and its subfolders, by file name"""
+    bl_idname = "vgeo.find_missing"
+    bl_label = "Find Missing Assets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(subtype='DIR_PATH')
+
+    def invoke(self, context, _event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        if not self.directory or not os.path.isdir(self.directory):
+            self.report({'ERROR'}, "Choose a folder")
+            return {'CANCELLED'}
+        found, missing = find_missing_assets(self.directory)
+        msg = f"Found {found} asset file(s)" + (f", {missing} still missing" if missing else "")
+        self.report({'WARNING'} if missing else {'INFO'}, msg)
+        return {'FINISHED'}
 
 
 class VGEO_OT_virtualize_instances(bpy.types.Operator):
@@ -491,7 +551,7 @@ class VGEO_OT_restore_instances(bpy.types.Operator):
 
 classes = (VGEOObjectSettings, VGEOInstanceSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web,
            VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_OT_virtualize_instances,
-           VGEO_OT_restore_instances, VGEO_PT_panel)
+           VGEO_OT_restore_instances, VGEO_OT_find_missing, VGEO_PT_panel)
 
 
 def _menu(self, _context):

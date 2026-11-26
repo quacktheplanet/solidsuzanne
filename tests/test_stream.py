@@ -1025,6 +1025,21 @@ def run():
     bpy.data.collections.remove(dcol)
     bpy.data.objects.remove(pdup)
 
+    # ---- a moved project: Find Missing Assets relinks the .vgeo by file name
+    import shutil
+    moved = os.path.join(OUT, "moved_assets", "deep")
+    os.makedirs(moved, exist_ok=True)
+    shutil.copy(good, moved)
+    proxy.vgeo.path = "//nowhere/" + os.path.basename(good)
+    rt = stream.runtime_for(proxy)
+    lost = vgeo.missing_assets()
+    found, still = vgeo.find_missing_assets(os.path.join(OUT, "moved_assets"))
+    rt = stream.runtime_for(proxy)
+    check("Find Missing Assets relinks a moved .vgeo", proxy in lost and found >= 1 and still == 0
+          and rt.asset is not None and proxy not in vgeo.missing_assets(), bpy.path.abspath(proxy.vgeo.path))
+    proxy.vgeo.path = good
+    stream.runtime_for(proxy)
+
     # ---- debug views: every mesh VGEO writes carries vgeo_viz while one is on
     from vgeo import debug as vdebug
     scene = bpy.context.scene
