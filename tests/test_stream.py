@@ -715,6 +715,24 @@ def run():
         oe = open_edges(np.concatenate(pos_all), np.concatenate(tri_all))
         check("instanced atom cut is watertight", oe == 0 and len(depths) >= 2,
               f"{oe} open edges, {len(mine)} atoms, depths {sorted(depths)}")
+        # blocks: the atoms of one parent group drawn as one piece when all are in the cut
+        blocks = asset.atoms(blocks=True)
+        unit_tris = np.concatenate([atoms["tri_count"], blocks["tri_count"]]).astype(np.int64)
+        bpairs, bst = asset.select_instances(instances.world_views(views, 1.0), tr, sc, mode="COARSEN", blocks=True)
+        per_a = np.bincount(pairs[:, 0], weights=atoms["tri_count"][pairs[:, 1]], minlength=len(sc))
+        per_b = np.bincount(bpairs[:, 0], weights=unit_tris[bpairs[:, 1]], minlength=len(sc))
+        check("blocks draw the same cut with fewer instances",
+              np.array_equal(per_a, per_b) and len(blocks) > 0 and (bpairs[:, 1] >= len(atoms)).any()
+              and len(bpairs) < len(pairs), f"{len(pairs)} atoms -> {len(bpairs)} units, {len(blocks)} blocks")
+        mine = bpairs[bpairs[:, 0] == near, 1]
+        pos_all, tri_all, base = [], [], 0
+        for k in mine:
+            d = asset.extract_atom(int(k))
+            pos_all.append(d["positions"].reshape(-1, 3))
+            tri_all.append(d["corner_verts"].reshape(-1, 3) + base)
+            base += d["vertex_count"]
+        oe = open_edges(np.concatenate(pos_all), np.concatenate(tri_all))
+        check("cut with blocks is watertight", oe == 0 and base > 0, f"{oe} open edges")
         asset.close()
 
         # the instancer switched to meshlet instancing: atom meshes, a point per pair, real instances
@@ -723,7 +741,7 @@ def run():
         libs = instances.atom_libraries(inst)
         lib_tris = sum(len(o.data.polygons) for o in libs.values())
         check("meshlet instancing: an atom library per slice, a cloud per slice, no streamed copies",
-              lib_tris == int(atoms["tri_count"].sum())
+              lib_tris == int(sum(inst["vgeo_atom_tris"]))
               and len(libs) == -(-len(atoms) // instances.ATOM_SLICE) == len(instances.atom_clouds(inst))
               and all(o.vgeo.slot_index < 0 for o in instances.slots(inst)))
         camera((0, -12, 1.5), target=(0, 30, -1), lens=35)

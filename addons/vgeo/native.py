@@ -193,14 +193,17 @@ def lib():
         L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
                                             c.c_char_p, c.c_int]
         L.vgeo_export_web_paged.restype = c.c_int
-    if hasattr(L, "vgeo_occlusion_new"):  # cut atoms (one call selects every copy), with occlusion
+    if hasattr(L, "vgeo_blocks"):  # cut atoms and blocks (one call selects every copy), with occlusion
         L.vgeo_atoms.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
         L.vgeo_atoms.restype = c.c_int
+        L.vgeo_blocks.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
+        L.vgeo_blocks.restype = c.c_int
         L.vgeo_extract_atom.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
         L.vgeo_extract_atom.restype = c.c_int
         L.vgeo_select_instances.argtypes = [c.c_void_p, c.POINTER(View), c.c_int, c.c_void_p, c.c_void_p,
                                             c.c_void_p, c.c_int, c.c_int, c.c_float, c.c_void_p, c.c_int,
-                                            c.c_void_p, c.c_void_p, c.c_uint32, c.POINTER(InstancesStats)]
+                                            c.c_void_p, c.c_int, c.c_void_p, c.c_uint32,
+                                            c.POINTER(InstancesStats)]
         L.vgeo_select_instances.restype = c.c_int
     if hasattr(L, "vgeo_occlusion_new"):
         L.vgeo_occlusion_new.argtypes = [c.c_int, c.c_int]
@@ -219,8 +222,8 @@ def lib():
 
 
 def has_atoms():
-    try:   # the build that has occlusion has the final vgeo_select_instances signature
-        return hasattr(lib(), "vgeo_occlusion_new")
+    try:   # the build with blocks has the current vgeo_select_instances signature
+        return hasattr(lib(), "vgeo_blocks")
     except RuntimeError:
         return False
 
@@ -429,12 +432,14 @@ class Asset:
             raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_export_web failed")
         return size.value
 
-    def atoms(self):
-        """Structured array of the asset's cut atoms (group, refined, tri_count, depth, center, radius)."""
+    def atoms(self, blocks=False):
+        """Structured array of the asset's cut atoms (group, refined, tri_count, depth, center, radius);
+        blocks=True: the blocks instead (unit ids after the atoms)."""
         L = lib()
-        n = L.vgeo_atoms(self._h, None, 0)
+        fn = L.vgeo_blocks if blocks else L.vgeo_atoms
+        n = fn(self._h, None, 0)
         arr = (Atom * max(1, n))()
-        L.vgeo_atoms(self._h, ctypes.byref(arr), n)
+        fn(self._h, ctypes.byref(arr), n)
         dt = np.dtype([("group", np.int32), ("refined", np.int32), ("cluster_offset", np.uint32),
                        ("cluster_count", np.uint32), ("tri_count", np.uint32), ("depth", np.uint32),
                        ("center", np.float32, 3), ("radius", np.float32)])
@@ -449,7 +454,7 @@ class Asset:
         return _chunk_arrays(d)
 
     def select_instances(self, views, transforms, scales, mode="COARSEN", offscreen_scale=8.0, lights=(),
-                         mask=None, pairs=None, occlusion=None):
+                         mask=None, pairs=None, occlusion=None, blocks=False):
         """Cut of every copy in one call. views: world-space View list; transforms: (n, 3, 4) float32
         local-to-world; scales: (n,) float32. Returns ((m, 2) uint32 (copy, atom) pairs, InstancesStats)."""
         L = lib()
@@ -466,7 +471,7 @@ class Asset:
             rc = L.vgeo_select_instances(self._h, varr, len(views), _ptr(tr), _ptr(sc), _ptr(mk), n,
                                          OFFSCREEN_MODES[mode], float(offscreen_scale),
                                          ctypes.byref(larr) if larr is not None else None, len(lights),
-                                         occlusion._h if occlusion is not None else None,
+                                         occlusion._h if occlusion is not None else None, 1 if blocks else 0,
                                          _ptr(pairs), len(pairs), ctypes.byref(stats))
             if rc == 2:   # more pairs than room: grow and select again
                 pairs = np.empty((int(stats.pairs * 1.25) + 1024, 2), dtype=np.uint32)

@@ -199,8 +199,14 @@ typedef struct vgeo_atom {
 // Number of atoms; writes min(max_atoms, count) atoms to out (out may be NULL).
 VGEO_API int vgeo_atoms(void* handle, vgeo_atom* out, int max_atoms);
 
-// Extract one atom as an indexed mesh (same layout as vgeo_extract; valid until the next extract).
-VGEO_API int vgeo_extract_atom(void* handle, uint32_t atom, vgeo_chunk_data* out);
+// Blocks: the atoms simplified from one parent group (two or more of them), drawn as one piece when
+// all are in a copy's cut (fewer instances, same triangles). group = -1, refined = the parent group,
+// cluster_offset / cluster_count index the block's atoms. Unit ids: atoms 0..A-1, then blocks A..A+B-1.
+VGEO_API int vgeo_blocks(void* handle, vgeo_atom* out, int max_blocks);
+
+// Extract one unit (an atom, or a block for ids >= the atom count) as an indexed mesh (same layout as
+// vgeo_extract; valid until the next extract).
+VGEO_API int vgeo_extract_atom(void* handle, uint32_t unit, vgeo_chunk_data* out);
 
 // Lights that let copies outside the view stay, because their shadow can reach it (Shadows mode).
 typedef struct vgeo_shadow_light {
@@ -215,6 +221,7 @@ typedef struct vgeo_shadow_light {
 
 enum { VGEO_OFFSCREEN_FULL = 0, VGEO_OFFSCREEN_COARSEN = 1, VGEO_OFFSCREEN_CULL = 2,
        VGEO_OFFSCREEN_SHADOWS = 3 };
+enum { VGEO_SELECT_BLOCKS = 1 };   // flags: emit blocks (unit ids >= atom count) where all their atoms are in
 
 typedef struct vgeo_instances_stats {
     uint64_t triangles;           // over every pair written
@@ -234,7 +241,8 @@ VGEO_API int vgeo_select_instances(void* handle, const vgeo_view* views, int vie
                                    const float* transforms, const float* scales, const uint8_t* copy_mask,
                                    int copy_count, int mode, float offscreen_scale,
                                    const vgeo_shadow_light* lights, int light_count, const void* occlusion,
-                                   uint32_t* out_pairs, uint32_t max_pairs, vgeo_instances_stats* stats);
+                                   int flags, uint32_t* out_pairs, uint32_t max_pairs,
+                                   vgeo_instances_stats* stats);
 
 // ---------------------------------------------------------------- occlusion culling
 //

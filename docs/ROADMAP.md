@@ -194,7 +194,10 @@ default; branch `phase2-atoms`):
       once when it stops); per-copy level fallback under an instance budget.
 - [x] Tests: atom cut = per-cluster cut, watertight instanced cut, culled atoms
       leave the instancing, final render cut, save/load, switching back.
-- [ ] Parent-merged blocks (fewer instances).
+- [x] Parent-merged blocks: the atoms of one parent group drawn as one piece
+      when all are in a copy's cut (statue avenue: 17-33 % fewer instances, same
+      triangles; costs one more copy of the DAG's geometry in Blender meshes,
+      the avenue .blend grows from 303 to 397 MB).
 - [ ] Proxies as single-copy instancers; retire chunk meshes and streamed copies
       (needs the owner's go).
 
@@ -217,6 +220,20 @@ T2, GUI viewport flying the film path (`tests/viewport_bench.py --cameras ...
 | Statue avenue, atoms | 53.6 fps | 23.6 fps (96 ms) | 42.7 fps |
 | Synthetic field, today | 33.9 fps | 21.6 fps (131 ms) | 52.2 fps |
 | Synthetic field, atoms, 8k instance budget | 92.2 fps | 43.5 fps (44 ms) | 53.7 fps |
+
+At a 1280x800 window (1048x683 region, about the bench's 720p), with blocks
+(`--window-geometry 0 0 1280 800`):
+
+| | Solid flying | EEVEE flying (worst frame) | EEVEE still |
+|---|---|---|---|
+| Statue avenue, today | 16.3 fps | 13.1 fps (210 ms) | 30.5 fps |
+| Statue avenue, atoms | 64.2 fps | 36.3 fps (75 ms) | 53.7 fps |
+| Synthetic field, today | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
+| Synthetic field, atoms | 93.2 fps | 45.1 fps (44 ms) | 52.8 fps |
+
+T2 holds at this size on both scenes. Open: the synthetic field's still EEVEE
+frame is slower than today's (8k instances cost more than the triangles they
+save in a small viewport); an adaptive budget would fix it.
 
 Run-to-run spread of EEVEE numbers on this remote machine is about 20 %. The
 synthetic field first ran with a fixed 300-triangle cost per instance (29.5

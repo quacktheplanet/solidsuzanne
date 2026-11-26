@@ -713,8 +713,10 @@ def select_atoms(inst, asset, views, pixel_error, mode=None, offscreen_scale=Non
     lights = native_lights(_scene_of(inst), getattr(vi, "shadow_distance", 0.0)) if mode == "SHADOWS" else []
     if occlusion is True:
         occlusion = _occlusion_current if getattr(vi, "use_occlusion", False) else None
+    blocks = len(inst.get("vgeo_atom_tris", ())) > int(inst.get("vgeo_atom_count", 1 << 30))
     return asset.select_instances(world_views(views, pixel_error), tr, sc, mode=mode,
-                                  offscreen_scale=offscreen_scale, lights=lights, occlusion=occlusion or None)
+                                  offscreen_scale=offscreen_scale, lights=lights, occlusion=occlusion or None,
+                                  blocks=blocks)
 
 
 def _clear_fronts(ob):
@@ -915,6 +917,7 @@ ATOM_FACE_ATTR = "vgeo_atom_local"
 ATOMS_NODE_GROUP = "VGEO Atoms"
 LIBRARY_NODE_GROUP = "VGEO Atom Library"
 ATOM_SLICE = 512
+USE_BLOCKS = os.environ.get("VGEO_BLOCKS", "1") == "1"   # blocks: atoms of one parent group as one piece
 SLICE_PROP = "vgeo_atom_slice"   # on a cloud object: its slice index
 LIB_PROP = "vgeo_atom_library"   # on a library object: its slice index
 
@@ -1066,6 +1069,8 @@ def build_atoms(inst):
     uid = vi.uid
     asset = _atom_asset(inst)
     atoms = asset.atoms()
+    blocks = asset.atoms(blocks=True) if USE_BLOCKS else atoms[:0]
+    units = len(atoms) + len(blocks)   # unit ids: atoms, then blocks
     col = vi.atoms
     if col is None:
         col = bpy.data.collections.new(f".vgeo atoms {uid}")
@@ -1077,8 +1082,8 @@ def build_atoms(inst):
     _remove_objects(atom_clouds(inst).values())
     materials = tuple(vi.source.data.materials)
     lib_ng = ensure_library_node_group()
-    for k in range(-(-len(atoms) // ATOM_SLICE)):
-        lo, hi = k * ATOM_SLICE, min(len(atoms), (k + 1) * ATOM_SLICE)
+    for k in range(-(-units // ATOM_SLICE)):
+        lo, hi = k * ATOM_SLICE, min(units, (k + 1) * ATOM_SLICE)
         parts, local = [], []
         for a in range(lo, hi):
             d = asset.extract_atom(a)
@@ -1097,7 +1102,8 @@ def build_atoms(inst):
         mod = ob.modifiers.new("VGEO Atom Library", 'NODES')
         mod.node_group = lib_ng
         col.objects.link(ob)
-    inst["vgeo_atom_tris"] = [int(t) for t in atoms["tri_count"]]
+    inst["vgeo_atom_tris"] = [int(t) for t in np.concatenate([atoms["tri_count"], blocks["tri_count"]])]
+    inst["vgeo_atom_count"] = len(atoms)
     for key in [k for k in _atom_state if k[0] == uid]:
         del _atom_state[key]
     _atom_clouds.pop(uid, None)
