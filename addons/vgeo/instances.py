@@ -224,17 +224,96 @@ def _scene_of(inst):
     return inst.users_scene[0] if inst.users_scene else bpy.context.scene
 
 
-def sun_directions(scene):
-    """World-space directions the light of each shadow-casting sun lamp travels in (unit vectors)."""
-    out = []
+_lights_cache = None   # scene name -> shadow_lights(scene), only while a tick or render update runs
+
+
+class tick_scope:
+    """Cache the scene's shadow-casting lights for the duration of one live tick or render update
+    (every instancer's update reads them; scanning scene.objects per instancer is wasted)."""
+
+    def __enter__(self):
+        global _lights_cache
+        self.outer = _lights_cache is not None
+        if not self.outer:
+            _lights_cache = {}
+        return self
+
+    def __exit__(self, *exc):
+        global _lights_cache
+        if not self.outer:
+            _lights_cache = None
+        return False
+
+
+def _light_range(light, scene):
+    """Distance beyond which a point or spot light no longer lights anything: its custom distance,
+    else EEVEE's influence radius (where its power falls below the scene's light threshold)."""
+    if getattr(light, "use_custom_distance", False):
+        return float(light.cutoff_distance)
+    threshold = 0.01
+    ee = getattr(scene, "eevee", None)
+    if ee is not None:
+        threshold = float(getattr(ee, "light_threshold", threshold))
+    power = max(light.color) * abs(light.energy) / 100.0 * max(1.0, getattr(light, "specular_factor", 1.0))
+    return math.sqrt(max(1e-16, power / max(1e-16, threshold)))
+
+
+def shadow_lights(scene):
+    """(suns, locals): world-space unit directions the light of each shadow-casting sun travels in,
+    and (position, range, axis, half_angle) of each shadow-casting point or spot light
+    (axis None and half_angle pi for point lights)."""
+    key = scene.name if scene is not None else ""
+    if _lights_cache is not None and key in _lights_cache:
+        return _lights_cache[key]
+    suns, local = [], []
     for ob in scene.objects if scene is not None else ():
-        if ob.type == 'LIGHT' and ob.data.type == 'SUN' and not ob.hide_render and \
-                getattr(ob.data, "use_shadow", True):
+        if ob.type != 'LIGHT' or ob.hide_render or not getattr(ob.data, "use_shadow", True):
+            continue
+        la = ob.data
+        if la.type == 'SUN':
             d = np.array(ob.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
             n = np.linalg.norm(d)
             if n > 0:
-                out.append(d / n)
+                suns.append(d / n)
+        elif la.type in ('POINT', 'SPOT'):
+            pos = np.array(ob.matrix_world.translation, dtype=np.float64)
+            rng = _light_range(la, scene) + float(getattr(la, "shadow_soft_size", 0.0))
+            axis, half = None, math.pi
+            if la.type == 'SPOT':
+                a = np.array(ob.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0)), dtype=np.float64)
+                n = np.linalg.norm(a)
+                if n > 0:
+                    axis, half = a / n, min(math.pi, float(la.spot_size) * 0.5)
+            local.append((pos, rng, axis, half))
+    out = (suns, local)
+    if _lights_cache is not None:
+        _lights_cache[key] = out
     return out
+
+
+def sun_directions(scene):
+    """World-space directions the light of each shadow-casting sun lamp travels in (unit vectors)."""
+    return shadow_lights(scene)[0]
+
+
+def _lit_by_local(world, radius, local, planes):
+    """Copies a shadow-casting point or spot light reaches, for lights whose range reaches the view:
+    such a copy can throw a shadow onto what the view sees (conservative: no occlusion test)."""
+    hit = np.zeros(len(world), bool)
+    for pos, rng, axis, half in local:
+        # the light's sphere of influence must touch the view, or nothing it lights is seen
+        if np.any(planes[:, :3] @ pos + planes[:, 3] < -rng):
+            continue
+        v = world - pos
+        dist = np.linalg.norm(v, axis=1)
+        near = dist - radius <= rng
+        if axis is not None and half < math.pi * 0.5 + 1e-6:
+            inside = dist <= radius
+            cosang = np.clip((v @ axis) / np.maximum(dist, 1e-12), -1.0, 1.0)
+            ang = np.arccos(cosang) - np.arcsin(np.clip(radius / np.maximum(dist, 1e-12), 0.0, 1.0))
+            near &= inside | (ang <= half)
+        hit |= near
+    return hit
 
 
 def _shadow_reaches(dist, planes, radius, suns, reach):
@@ -270,7 +349,7 @@ def _choose(inst, views, pixel_error, mode=None, offscreen_scale=None):
     budget = np.full(n, np.inf)
     culling = mode in ("CULL", "SHADOWS")
     keep = np.zeros(n, bool) if culling else np.ones(n, bool)
-    suns = sun_directions(_scene_of(inst)) if mode == "SHADOWS" else []
+    suns, local = shadow_lights(_scene_of(inst)) if mode == "SHADOWS" else ([], [])
     reach = getattr(vi, "shadow_distance", 0.0) or None
     for view, window, height, persp, clip_start in views:
         cam = np.array(view.inverted().translation, dtype=np.float64)
@@ -289,6 +368,8 @@ def _choose(inst, views, pixel_error, mode=None, offscreen_scale=None):
                 keep |= inside
                 if suns:
                     keep |= _shadow_reaches(dist, planes, radius, suns, reach)
+                if local:
+                    keep |= _lit_by_local(world, radius, local, planes)
         budget = np.minimum(budget, b / s)   # error allowed in asset units
     levels = np.searchsorted(errors, budget, side="right") - 1
     levels = np.clip(levels, int(vi.min_level), len(errors) - 1).astype(np.int32)
@@ -661,5 +742,8 @@ def create_instancer(context, source, surface, count, seed=0, scale_range=(0.7, 
     inst.vgeo_inst.source = source
     inst.vgeo_inst.pixel_error = source.vgeo.pixel_error
     inst.vgeo_inst.render_pixel_error = source.vgeo.render_pixel_error
+    # new instancers drop off-screen copies unless their shadow can reach the view; the property
+    # default stays Coarsen so files saved before this keep rendering what they did
+    inst.vgeo_inst.offscreen = 'SHADOWS'
     build_levels(inst, source)
     return inst

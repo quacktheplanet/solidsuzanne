@@ -814,9 +814,10 @@ def update_for_render(scene, depsgraph=None):
         return
     from . import instances
     # instancers first: they choose which copies get a streamed cut and make it now
-    for inst in instances.instancers(scene):
-        if not inst.hide_render:
-            instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
+    with instances.tick_scope():
+        for inst in instances.instancers(scene):
+            if not inst.hide_render:
+                instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
     for obj in proxies(scene):
         if obj.vgeo.collection is not None:
             sync_visibility(obj)
@@ -875,12 +876,13 @@ def _tick():
         views = viewport_views()
         if not views:
             return 0.25
-        for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
-            try:
-                if vl is None or inst.visible_get(view_layer=vl):
-                    instances.update(inst, views, inst.vgeo_inst.pixel_error)
-            except RuntimeError:
-                continue
+        with instances.tick_scope():
+            for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
+                try:
+                    if vl is None or inst.visible_get(view_layer=vl):
+                        instances.update(inst, views, inst.vgeo_inst.pixel_error)
+                except RuntimeError:
+                    continue
         if not objs:
             return TICK
         visible = []

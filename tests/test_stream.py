@@ -3,6 +3,7 @@
 Run:  blender -b --factory-startup --python tests/test_stream.py [-- --out DIR]
 """
 
+import math
 import os
 import sys
 import tempfile
@@ -442,6 +443,10 @@ def run():
     rc = bpy.ops.vgeo.scatter(count=400, seed=3, scale_min=0.6, scale_max=1.2)
     inst = bpy.context.active_object
     check("scatter creates an instancer", rc == {'FINISHED'} and inst.vgeo_inst.uid and len(inst.data.vertices) == 400)
+    check("new instancers default to Shadows, the property (old files) to Coarsen",
+          inst.vgeo_inst.offscreen == 'SHADOWS'
+          and type(inst.vgeo_inst).bl_rna.properties["offscreen"].default == 'COARSEN')
+    inst.vgeo_inst.offscreen = 'COARSEN'   # the checks below were written against Coarsen
     errs = list(inst["vgeo_level_errors"])
     lvl_tris = list(inst["vgeo_level_tris"])
     check("one level mesh per LOD level", len(inst.vgeo_inst.levels.objects) == len(errs) == rt.asset.info["lod_levels"],
@@ -614,6 +619,42 @@ def run():
     instances.update(st, views, 1.0)
     st.data.attributes["vgeo_level"].data.foreach_get("value", lv3)
     check("without a sun, sun shadows culls like Cull", lv3[1] < 0, str(lv3.tolist()))
+
+    def levels3(light_ob):
+        scene.collection.objects.link(light_ob)
+        bpy.context.view_layer.update()
+        instances.update(st, views, 1.0)
+        out = np.empty(3, np.int32)
+        st.data.attributes["vgeo_level"].data.foreach_get("value", out)
+        bpy.data.objects.remove(light_ob)
+        return out
+
+    def lamp(kind, pos, dist, down=True, size=None):
+        la = bpy.data.lights.new("ShadowLamp", kind)
+        la.use_custom_distance, la.cutoff_distance = True, dist
+        if size is not None:
+            la.spot_size = size
+        ob = bpy.data.objects.new("ShadowLamp", la)
+        ob.location = pos
+        ob.rotation_euler = (0, 0, 0) if down else (math.pi, 0, 0)
+        return ob
+
+    # a point lamp beside the view, its light reaching both the left copy and the view
+    lv = levels3(lamp('POINT', (-22, 20, 3), 10))
+    check("point lamp keeps the copy it lights", lv[0] >= 0 and lv[1] >= 0 and lv[2] < 0, str(lv.tolist()))
+    # a point lamp that reaches the left copy, but whose light never reaches the view
+    lv = levels3(lamp('POINT', (-40, 20, 3), 19))
+    check("point lamp out of the view's reach keeps nothing", lv[1] < 0 and lv[2] < 0, str(lv.tolist()))
+    # a spot lamp above the left copy: kept when it points down at it, dropped when it points away
+    lv = levels3(lamp('SPOT', (-22, 20, 10), 15, down=True, size=math.radians(40)))
+    check("spot lamp keeps the copy in its cone", lv[1] >= 0 and lv[2] < 0, str(lv.tolist()))
+    lv = levels3(lamp('SPOT', (-22, 20, 10), 15, down=False, size=math.radians(40)))
+    check("spot lamp pointing away keeps nothing", lv[1] < 0 and lv[2] < 0, str(lv.tolist()))
+    # shadow_lights is cached only inside a tick scope, and the cache ends with it
+    with instances.tick_scope():
+        first = instances.shadow_lights(scene)
+        check("lights cached within a tick", instances.shadow_lights(scene) is first)
+    check("light cache cleared after the tick", instances._lights_cache is None)
     col = st.vgeo_inst.levels
     bpy.data.objects.remove(st)
     for o in list(col.objects):

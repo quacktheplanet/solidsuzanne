@@ -78,9 +78,11 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
         name="Off-screen", default='COARSEN',
         items=[('COARSEN', "Coarsen", "Keep copies outside the view at reduced detail, so they still cast "
                                       "shadows and show in reflections"),
-               ('SHADOWS', "Sun Shadows", "Drop copies outside the view unless their shadow from a sun lamp can "
-                                          "reach it (point and spot shadows and reflections of dropped copies "
-                                          "are lost; without a sun lamp this is the same as Cull)"),
+               ('SHADOWS', "Shadows", "Drop copies outside the view unless they can shadow what it shows: "
+                                      "copies whose shadow from a sun lamp can reach the view, and copies "
+                                      "within reach of a point or spot lamp that lights the view, are kept "
+                                      "(reflections of dropped copies are lost; with no shadow-casting "
+                                      "lamp this is the same as Cull)"),
                ('CULL', "Cull", "Drop every copy outside the view (fastest; their shadows and reflections "
                                 "are lost)")])
     offscreen_scale: FloatProperty(name="Off-screen Error", default=8.0, min=1.0, soft_max=64.0,
