@@ -129,3 +129,19 @@ spec/                    Format specifications
 ## Acknowledgments
 
 Built on insights from Epic Games' Nanite, [meshoptimizer](https://github.com/zeux/meshoptimizer) by Arseny Kapoulkine, and NVIDIA mesh shader research.
+
+---
+
+## License
+
+VGEO is free and open source software under the [GNU General Public License
+v3.0 or later](LICENSE), the GPL like Blender itself: use it for anything,
+commercial work included; if you distribute a modified version, share its source
+under the same terms. Third-party components are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## Support development
+
+VGEO is built in spare time. If it is useful to you, you can
+[sponsor it on GitHub](https://github.com/sponsors/quacktheplanet); donations decide
+what comes next on the [roadmap](docs/ROADMAP.md), such as macOS and Linux builds.
