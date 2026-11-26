@@ -776,6 +776,21 @@ def run():
         n_r, t_r = drawn()
         check("final render cuts at the render error", t_r > t_x, f"{t_r:,} vs {t_x:,}")
         inst.vgeo_inst.offscreen = 'COARSEN'
+        # clouds follow the instancer's visibility
+        clouds = list(instances.atom_clouds(inst).values())
+        inst.hide_render = True
+        stream.update_for_render(scene)
+        hidden_r = all(o.hide_render for o in clouds)
+        inst.hide_render = False
+        stream.update_for_render(scene)
+        vl = bpy.context.view_layer
+        inst.hide_set(True)
+        instances.sync_cloud_visibility(inst, vl)
+        hidden_v = all(not o.visible_get() for o in clouds)
+        inst.hide_set(False)
+        instances.sync_cloud_visibility(inst, vl)
+        check("atom clouds hide with their instancer", hidden_r and hidden_v and clouds
+              and all(o.visible_get() and not o.hide_render for o in clouds))
         bpy.ops.wm.save_mainfile()
         bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
         inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
@@ -790,6 +805,18 @@ def run():
         instances.update(inst, views, 1.0)
         n_o, _ = drawn()
         check("switching back shows whole-copy levels", n_o == len(inst.data.vertices), str(n_o))
+        # a deleted instancer's clouds leave the scene (on a copy, so the rest of the suite keeps it)
+        dup = inst.copy()
+        dup.data = inst.data.copy()
+        dup.vgeo_inst.uid = stream.new_uid()
+        dup.vgeo_inst.atoms = None
+        bpy.context.scene.collection.objects.link(dup)
+        dup.vgeo_inst.use_atoms = True
+        dclouds = [o.name for o in instances.atom_clouds(dup).values()]
+        bpy.data.objects.remove(dup)
+        instances.unlink_orphan_slots()
+        gone = all(not bpy.data.objects[n].users_collection for n in dclouds if n in bpy.data.objects)
+        check("a deleted instancer's clouds leave the scene", bool(dclouds) and gone, str(len(dclouds)))
         proxy = next(o for o in bpy.data.objects if o.vgeo.uid)
 
     inst.vgeo_inst.offscreen = 'COARSEN'

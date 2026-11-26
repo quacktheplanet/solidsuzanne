@@ -815,6 +815,9 @@ def update_for_render(scene, depsgraph=None):
     from . import instances
     # instancers first: they choose which copies get a streamed cut and make it now
     with instances.tick_scope():
+        for inst in instances.instancers(scene):
+            if inst.vgeo_inst.atoms is not None:
+                instances.sync_cloud_visibility(inst)
         insts = [i for i in instances.instancers(scene) if not i.hide_render]
         instances.prepare_occlusion(insts, [view])
         for inst in insts:
@@ -868,6 +871,9 @@ def _tick():
         from . import instances
         # idle streamed copies (slot_index < 0) belong to an instancer and show nothing
         objs = [o for o in proxies() if not o.vgeo.freeze and not (o.vgeo.slot_of and o.vgeo.slot_index < 0)]
+        for inst in instances.instancers():
+            if inst.vgeo_inst.atoms is not None:
+                instances.sync_cloud_visibility(inst, bpy.context.view_layer)
         insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
         if not objs and not insts:
             _orphan_check()  # a deleted proxy's chunks must not linger

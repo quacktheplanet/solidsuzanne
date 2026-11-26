@@ -810,12 +810,42 @@ def sync_slots(inst):
 
 
 def unlink_orphan_slots():
-    """Streamed copies whose instancer was deleted: take them out of the scene."""
+    """Streamed copies and atom clouds whose instancer was deleted: take them out of the scene."""
     live = {o.vgeo_inst.uid for o in bpy.data.objects if o.vgeo_inst.uid and o.users}
     for ob in [o for o in bpy.data.objects if o.vgeo.slot_of and o.users]:
         if ob.vgeo.slot_of not in live or ob.parent is None or ob.parent.vgeo_inst.uid != ob.vgeo.slot_of:
             for col in list(ob.users_collection):
                 col.objects.unlink(ob)
+    for ob in [o for o in bpy.data.objects if SLICE_PROP in o and o.users_collection]:
+        p = ob.parent
+        if p is None or not p.vgeo_inst.uid or not p.users_collection:
+            for col in list(ob.users_collection):
+                col.objects.unlink(ob)
+
+
+def sync_cloud_visibility(inst, vl=None):
+    """Atom clouds are separate objects: they hide and show with their instancer (viewport, render,
+    and the view layer's hide), and stay hidden while Meshlet Instancing is off."""
+    on = bool(getattr(inst.vgeo_inst, "use_atoms", False))
+    try:
+        hidden = inst.hide_get(view_layer=vl) if vl is not None else inst.hide_get()
+    except RuntimeError:
+        hidden = False
+    hv, hr = inst.hide_viewport or not on, inst.hide_render or not on
+    for ob in atom_clouds(inst).values():
+        if ob.hide_viewport != hv:
+            ob.hide_viewport = hv
+        if ob.hide_render != hr:
+            ob.hide_render = hr
+        try:
+            cur = ob.hide_get(view_layer=vl) if vl is not None else ob.hide_get()
+            if cur != hidden:
+                if vl is not None:
+                    ob.hide_set(hidden, view_layer=vl)
+                else:
+                    ob.hide_set(hidden)
+        except RuntimeError:
+            pass
 
 
 # ---------------------------------------------------------------- scattering
@@ -1137,8 +1167,6 @@ def _ensure_clouds(inst):
         for col in inst.users_collection:
             if ob.name not in col.objects:
                 col.objects.link(ob)
-        if ob.hide_viewport or ob.hide_render:
-            ob.hide_viewport = ob.hide_render = False
         out[k] = ob
     vi.atom_points = out.get(0)
     return out
@@ -1154,14 +1182,14 @@ def set_use_atoms(inst, on):
         if vi.atoms is None or not atom_libraries(inst):
             build_atoms(inst)
         _ensure_clouds(inst)
+        sync_cloud_visibility(inst)
         flags = _streamed_flags(inst)   # streamed copies are not needed: every copy is cut
         for ob in slots(inst):
             if ob.vgeo.slot_index >= 0:
                 _release_slot(inst, ob, flags)
         _write_streamed(inst, flags)
     else:
-        for ob in atom_clouds(inst).values():
-            ob.hide_viewport = ob.hide_render = True
+        sync_cloud_visibility(inst)
         for key in [k for k in _atom_state if k[0] == vi.uid]:
             del _atom_state[key]
     _atom_clouds.pop(vi.uid, None)
@@ -1208,7 +1236,7 @@ def _clouds_fast(inst):
     clouds = _atom_clouds.get(uid)
     if clouds is not None:
         try:
-            if all(not ob.hide_viewport and ob.parent == inst for ob in clouds.values()):
+            if all(ob.parent == inst for ob in clouds.values()):
                 return clouds
         except ReferenceError:
             pass
