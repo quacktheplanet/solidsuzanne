@@ -1,82 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(vgeo VERSION 0.1.0 LANGUAGES CXX)
+project(vgeo VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-# Static libs get linked into the Python shared module, so they must be PIC
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Options
-option(VGEO_BUILD_VIEWER "Build standalone viewer (requires Vulkan)" ON)
-option(VGEO_BUILD_TOOLS "Build CLI tools" ON)
-option(VGEO_BUILD_TESTS "Build tests" ON)
-option(VGEO_BUILD_PYTHON "Build Python bindings for Blender" ON)
-
-# Find Vulkan (optional - only needed for viewer/runtime)
-find_package(Vulkan QUIET)
-if(Vulkan_FOUND)
-    message(STATUS "Vulkan found: ${Vulkan_INCLUDE_DIRS}")
-    set(VGEO_HAS_VULKAN ON)
-else()
-    message(WARNING "Vulkan SDK not found. Viewer and runtime will not be built.")
-    message(WARNING "Install Vulkan SDK from https://vulkan.lunarg.com/ to enable rendering.")
-    set(VGEO_HAS_VULKAN OFF)
-    set(VGEO_BUILD_VIEWER OFF)
-    # Python bindings wrap the Vulkan runtime, so they cannot build without it
-    set(VGEO_BUILD_PYTHON OFF)
-endif()
-
-# GLFW for windowing. vgeo_runtime links glfw (not just the viewer), so it
-# must be available whenever Vulkan targets are built.
-if(VGEO_HAS_VULKAN)
-    include(FetchContent)
-    FetchContent_Declare(
-        glfw
-        GIT_REPOSITORY https://github.com/glfw/glfw.git
-        GIT_TAG        3.3.8
-    )
-    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(glfw)
-endif()
-
-# Streaming library (cluster LOD builder + runtime used by the Blender add-on).
-# Needs no Vulkan; configure with -DVGEO_STREAM_ONLY=ON to build just this.
-option(VGEO_BUILD_STREAM "Build the vgeo_stream shared library" ON)
-option(VGEO_STREAM_ONLY "Build only vgeo_stream" OFF)
-if(VGEO_BUILD_STREAM OR VGEO_STREAM_ONLY)
-    add_subdirectory(src/stream)
-endif()
-if(VGEO_STREAM_ONLY)
-    return()
-endif()
-
-# Subdirectories
-add_subdirectory(src/core)
-add_subdirectory(src/preprocess)
-add_subdirectory(src/scene)
-
-# Runtime and viewer require Vulkan
-if(VGEO_HAS_VULKAN)
-    add_subdirectory(src/runtime)
-    if(VGEO_BUILD_VIEWER)
-        add_subdirectory(src/viewer)
-    endif()
-endif()
-
-if(VGEO_BUILD_TOOLS)
-    add_subdirectory(tools/vgeo_build)
-    add_subdirectory(tools/vgeo_validate)
-endif()
-
-if(VGEO_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(tests)
-endif()
-
-# Python bindings for Blender integration
-if(VGEO_BUILD_PYTHON)
-    add_subdirectory(src/python)
-endif()
+# vgeo_stream: the cluster-LOD builder and runtime the Blender add-on loads (addons/vgeo/bin).
+# No Vulkan SDK or Python headers needed. VGEO_STREAM_ONLY is accepted for older build commands.
+option(VGEO_STREAM_ONLY "Kept for compatibility: only vgeo_stream is built" ON)
+add_subdirectory(src/stream)

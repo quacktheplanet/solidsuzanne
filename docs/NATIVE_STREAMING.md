@@ -1,8 +1,8 @@
 # Native streaming: virtualized geometry rendered by EEVEE and Cycles
 
-The original VGEO path renders meshlets with its own headless Vulkan
-renderer and copies the pixels into the viewport. That can never look like
-EEVEE or reach Cycles, because it replaces Blender's renderers instead of
+VGEO started as a headless Vulkan meshlet renderer whose pixels were copied
+into the viewport (removed in November 2026). That could never look like
+EEVEE or reach Cycles, because it replaced Blender's renderers instead of
 feeding them.
 
 The native streaming path keeps Blender's renderers and virtualizes the

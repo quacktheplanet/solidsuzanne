@@ -1,14 +1,12 @@
 # Third-party notices
 
 VGEO is licensed under the GNU General Public License, version 3 or (at your
-option) any later version (see `LICENSE`). It includes or builds against the
-following software, under their own licenses, all compatible with the GPL.
+option) any later version (see `LICENSE`). It includes the following software,
+under its own license, which is compatible with the GPL.
 
 | Component | Used in | License |
 |---|---|---|
 | [meshoptimizer](https://github.com/zeux/meshoptimizer) | compiled into `vgeo_stream` (the add-on's native library); `web/meshopt_decoder.mjs` | MIT |
-| [GLFW](https://github.com/glfw/glfw) | the original Vulkan proof of concept (viewer), fetched at build time | zlib |
-| [pybind11](https://github.com/pybind/pybind11) | the original Vulkan proof of concept (`vgeo_native` module), fetched at build time | BSD 3-Clause |
 
 ## meshoptimizer
 

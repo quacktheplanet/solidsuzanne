@@ -29,7 +29,7 @@ reports that number as `cut+cull`.
 
 1. `README.md`, then `docs/NATIVE_STREAMING.md` (how it works today, measured).
 2. `docs/ROADMAP.md` (targets, baseline numbers, phases 1-5, checklists).
-3. `spec/vgeo_format.md` and `src/stream/format_v2.h` (file layout and the cut rule).
+3. `src/stream/format_v2.h` (file layout and the cut rule) and `src/stream/vgeo_stream.h` (the C API).
 4. `addons/vgeo/instances.py` (instancers), `addons/vgeo/stream.py` (proxies,
    live loop, render handlers), `addons/vgeo/native.py` (ctypes bindings),
    `src/stream/runtime.cpp` (selection), `src/stream/build.cpp` (DAG build).
