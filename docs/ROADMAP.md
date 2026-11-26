@@ -235,6 +235,7 @@ At a 1280x800 window (1048x683 region, about the bench's 720p), with blocks
 | Synthetic field, today | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
 | Synthetic field, atoms | 93.2 fps | 45.1 fps (44 ms) | 52.8 fps |
 | Statue avenue, atoms, min gain 1,000 | 63.5 fps | 38.5 fps (79 ms) | 57.6 fps |
+| Statue avenue, atoms, min gain 1,000, no blocks | 86.2 fps | 50.5 fps (66 ms) | 78.8 fps |
 | Synthetic field, atoms, min gain 1,000 | 114.5 fps | 71.9 fps (39 ms) | 81.6 fps |
 
 With the instance budget alone, the synthetic field's still EEVEE frame was
