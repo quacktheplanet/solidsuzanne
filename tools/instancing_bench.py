@@ -171,6 +171,11 @@ def main():
     n_cams = len(cams) if cams else 1
     for ci in range(n_cams):
         view = bench_camera(cams[ci], scene) if cams else stream.camera_view(scene)
+        occ = None
+        if native.has_occlusion() and not flag("--no-atoms"):
+            t0 = time.perf_counter()
+            occ = instances.build_occlusion(insts, [view])
+            occ_ms = (time.perf_counter() - t0) * 1000
         for inst in insts:
             err = float(arg("--error", inst.vgeo_inst.render_pixel_error))
             inst.vgeo_inst.render_pixel_error = err   # streamed copies cut at their instancer's render error
@@ -188,6 +193,14 @@ def main():
                                                         transforms=tr)
                     row["atoms"][mode] = {"triangles": int(st.triangles), "pairs": int(st.pairs),
                                           "select_ms": round((time.perf_counter() - t0) * 1000, 2)}
+                    if occ is not None:
+                        t0 = time.perf_counter()
+                        _pairs, st = instances.select_atoms(inst, assets[inst.name], [view], err, mode=mode,
+                                                            transforms=tr, occlusion=occ)
+                        row["atoms"][mode + "+occ"] = {"triangles": int(st.triangles), "pairs": int(st.pairs),
+                                                       "select_ms": round((time.perf_counter() - t0) * 1000, 2),
+                                                       "occluder_tris": int(occ.triangles),
+                                                       "occlusion_ms": round(occ_ms, 1)}
             for mode in modes:
                 for slots in slot_counts:
                     if slots is not None:

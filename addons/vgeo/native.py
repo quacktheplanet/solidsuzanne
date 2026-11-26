@@ -193,22 +193,34 @@ def lib():
         L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
                                             c.c_char_p, c.c_int]
         L.vgeo_export_web_paged.restype = c.c_int
-    if hasattr(L, "vgeo_select_instances"):  # cut atoms: one call selects every copy
+    if hasattr(L, "vgeo_occlusion_new"):  # cut atoms (one call selects every copy), with occlusion
         L.vgeo_atoms.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
         L.vgeo_atoms.restype = c.c_int
         L.vgeo_extract_atom.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
         L.vgeo_extract_atom.restype = c.c_int
         L.vgeo_select_instances.argtypes = [c.c_void_p, c.POINTER(View), c.c_int, c.c_void_p, c.c_void_p,
                                             c.c_void_p, c.c_int, c.c_int, c.c_float, c.c_void_p, c.c_int,
-                                            c.c_void_p, c.c_uint32, c.POINTER(InstancesStats)]
+                                            c.c_void_p, c.c_void_p, c.c_uint32, c.POINTER(InstancesStats)]
         L.vgeo_select_instances.restype = c.c_int
+    if hasattr(L, "vgeo_occlusion_new"):
+        L.vgeo_occlusion_new.argtypes = [c.c_int, c.c_int]
+        L.vgeo_occlusion_new.restype = c.c_void_p
+        L.vgeo_occlusion_free.argtypes = [c.c_void_p]
+        L.vgeo_occlusion_free.restype = None
+        L.vgeo_occlusion_begin.argtypes = [c.c_void_p, c.c_void_p, c.c_void_p, c.c_float]
+        L.vgeo_occlusion_add.argtypes = [c.c_void_p, c.c_void_p, c.c_void_p, c.c_void_p, c.c_int, c.c_float,
+                                         c.c_uint64, c.POINTER(c.c_uint64)]
+        L.vgeo_occlusion_finish.argtypes = [c.c_void_p]
+        L.vgeo_occlusion_test.argtypes = [c.c_void_p, c.c_void_p, c.c_void_p, c.c_int, c.c_void_p]
+        L.vgeo_occlusion_depth.argtypes = [c.c_void_p, c.c_void_p]
+        L.vgeo_occlusion_config.argtypes = [c.c_void_p, c.c_uint64, c.c_int, c.c_int]
     _lib = L
     return L
 
 
 def has_atoms():
-    try:
-        return hasattr(lib(), "vgeo_select_instances")
+    try:   # the build that has occlusion has the final vgeo_select_instances signature
+        return hasattr(lib(), "vgeo_occlusion_new")
     except RuntimeError:
         return False
 
@@ -437,7 +449,7 @@ class Asset:
         return _chunk_arrays(d)
 
     def select_instances(self, views, transforms, scales, mode="COARSEN", offscreen_scale=8.0, lights=(),
-                         mask=None, pairs=None):
+                         mask=None, pairs=None, occlusion=None):
         """Cut of every copy in one call. views: world-space View list; transforms: (n, 3, 4) float32
         local-to-world; scales: (n,) float32. Returns ((m, 2) uint32 (copy, atom) pairs, InstancesStats)."""
         L = lib()
@@ -454,6 +466,7 @@ class Asset:
             rc = L.vgeo_select_instances(self._h, varr, len(views), _ptr(tr), _ptr(sc), _ptr(mk), n,
                                          OFFSCREEN_MODES[mode], float(offscreen_scale),
                                          ctypes.byref(larr) if larr is not None else None, len(lights),
+                                         occlusion._h if occlusion is not None else None,
                                          _ptr(pairs), len(pairs), ctypes.byref(stats))
             if rc == 2:   # more pairs than room: grow and select again
                 pairs = np.empty((int(stats.pairs * 1.25) + 1024, 2), dtype=np.uint32)
@@ -496,6 +509,69 @@ def _chunk_arrays(d):
         "tri_count": nt,
         "edge_count": d.edge_count,
     }
+
+
+class Occlusion:
+    """A small CPU depth buffer of coarse occluders, for vgeo_select_instances (one view)."""
+
+    def __init__(self, width=256, height=144):
+        L = lib()
+        if not hasattr(L, "vgeo_occlusion_new"):
+            raise RuntimeError("this build of the native library has no occlusion culling")
+        self._h = L.vgeo_occlusion_new(int(width), int(height))
+        self.width, self.height = int(width), int(height)
+        self.triangles = 0
+
+    def close(self):
+        if self._h:
+            lib().vgeo_occlusion_free(self._h)
+            self._h = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def config(self, copy_triangles=0, erode=True, push=True):
+        lib().vgeo_occlusion_config(self._h, int(copy_triangles), int(bool(erode)), int(bool(push)))
+
+    def begin(self, view_proj, camera, znear):
+        vp = np.ascontiguousarray(view_proj, dtype=np.float32).reshape(16)
+        cam = np.ascontiguousarray(camera, dtype=np.float32).reshape(3)
+        lib().vgeo_occlusion_begin(self._h, _ptr(vp), _ptr(cam), float(znear))
+        self.triangles = 0
+
+    def add(self, asset, transforms, scales, pixel_error=1.0, max_triangles=0):
+        tr = np.ascontiguousarray(transforms, dtype=np.float32).reshape(-1, 12)
+        sc = np.ascontiguousarray(scales, dtype=np.float32).ravel()
+        out = ctypes.c_uint64(0)
+        lib().vgeo_occlusion_add(self._h, asset._h, _ptr(tr), _ptr(sc), len(sc), float(pixel_error),
+                                 int(max_triangles), ctypes.byref(out))
+        self.triangles = out.value
+        return out.value
+
+    def finish(self):
+        lib().vgeo_occlusion_finish(self._h)
+
+    def test(self, centers, radii):
+        c = np.ascontiguousarray(centers, dtype=np.float32).reshape(-1, 3)
+        r = np.ascontiguousarray(radii, dtype=np.float32).ravel()
+        out = np.zeros(len(r), np.uint8)
+        lib().vgeo_occlusion_test(self._h, _ptr(c), _ptr(r), len(r), _ptr(out))
+        return out.astype(bool)
+
+    def depth(self):
+        out = np.empty(self.width * self.height, np.float32)
+        lib().vgeo_occlusion_depth(self._h, _ptr(out))
+        return out.reshape(self.height, self.width)
+
+
+def has_occlusion():
+    try:
+        return hasattr(lib(), "vgeo_occlusion_new")
+    except RuntimeError:
+        return False
 
 
 FRUSTUM_MODES = {"FULL": 0, "COARSEN": 1, "CULL": 2}

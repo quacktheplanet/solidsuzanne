@@ -720,10 +720,11 @@ def run():
         # the instancer switched to meshlet instancing: atom meshes, a point per pair, real instances
         inst.vgeo_inst.offscreen = 'COARSEN'
         inst.vgeo_inst.use_atoms = True
-        slices = instances.atom_slices(inst)
-        check("meshlet instancing builds one mesh per atom in slices, a cloud per slice, no streamed copies",
-              sum(len(c.objects) for c in slices) == len(atoms)
-              and len(slices) == -(-len(atoms) // instances.ATOM_SLICE) == len(instances.atom_clouds(inst))
+        libs = instances.atom_libraries(inst)
+        lib_tris = sum(len(o.data.polygons) for o in libs.values())
+        check("meshlet instancing: an atom library per slice, a cloud per slice, no streamed copies",
+              lib_tris == int(atoms["tri_count"].sum())
+              and len(libs) == -(-len(atoms) // instances.ATOM_SLICE) == len(instances.atom_clouds(inst))
               and all(o.vgeo.slot_index < 0 for o in instances.slots(inst)))
         camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
         views = [stream.camera_view(scene)]
@@ -740,7 +741,8 @@ def run():
 
         instances.update(inst, views, 1.0)
         n_c, t_c = drawn()
-        npts = sum(len(o.data.vertices) for o in instances.atom_clouds(inst).values())
+        npts = sum(int((np.array([v.value for v in o.data.attributes[instances.ATOM_ATTR].data]) >= 0).sum())
+                   for o in instances.atom_clouds(inst).values())
         check("one instance per (copy, atom) pair, nothing from levels",
               n_c == npts > 0 and t_c == inst.vgeo_inst.shown_triangles, f"{n_c} instances, {npts} points, "
               f"{t_c:,} vs {inst.vgeo_inst.shown_triangles:,} tris")

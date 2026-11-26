@@ -21,6 +21,8 @@ tick, so the surface never shows a gap or two overlapping versions.
 """
 
 import math
+import os
+import time
 
 import bpy
 import numpy as np
@@ -407,14 +409,14 @@ def triangles_for(inst, levels, streamed=None):
     return int(tris[levels[shown]].sum())
 
 
-def update(inst, views, pixel_error, mode=None, offscreen_scale=None, render=False):
+def update(inst, views, pixel_error, mode=None, offscreen_scale=None, render=False, paced=False):
     """Choose levels and streamed copies for these views. render=True: the streamed copies get
     their cut now and take over at once (final renders are synchronous). mode and offscreen_scale
     default to the instancer's Off-screen settings."""
     mode = mode or getattr(inst.vgeo_inst, "offscreen", "COARSEN")
     offscreen_scale = offscreen_scale or getattr(inst.vgeo_inst, "offscreen_scale", 8.0)
     if getattr(inst.vgeo_inst, "use_atoms", False) and inst.vgeo_inst.atoms is not None and native.has_atoms():
-        return update_atoms(inst, views, pixel_error, mode, offscreen_scale)
+        return update_atoms(inst, views, pixel_error, mode, offscreen_scale, paced and not render)
     levels, budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
     changed = apply_levels(inst, levels)
     wanted = _wanted_slots(inst, levels, budget)
@@ -642,15 +644,77 @@ def world_views(views, pixel_error):
     return out
 
 
-def select_atoms(inst, asset, views, pixel_error, mode=None, offscreen_scale=None, transforms=None):
-    """A meshlet cut on every copy in one native call: ((m, 2) uint32 (copy, atom) pairs, stats)."""
+OCCLUSION_SIZE = tuple(int(x) for x in os.environ.get("VGEO_OCCLUSION_SIZE", "256x144").split("x"))
+OCCLUDER_COPIES = int(os.environ.get("VGEO_OCCLUDER_COPIES", 128))   # nearest copies in view drawn
+OCCLUDER_TRIANGLES = int(os.environ.get("VGEO_OCCLUDER_TRIANGLES", 200_000))
+
+_occlusion = None          # native.Occlusion, reused
+_occlusion_current = None  # built for this tick's view by prepare_occlusion, used by select_atoms
+
+
+def build_occlusion(insts, views):
+    """Draw the nearest copies of these instancers (coarse levels) into the occlusion buffer for a
+    single perspective view. Returns the native.Occlusion, or None when it does not apply."""
+    global _occlusion
+    if len(views) != 1 or not native.has_occlusion():
+        return None
+    view, window, height, persp, clip_start = views[0]
+    if not persp:
+        return None
+    if _occlusion is None:
+        _occlusion = native.Occlusion(*OCCLUSION_SIZE)
+        if "VGEO_OCCLUSION_CONFIG" in os.environ:   # experiments: "copy_tris,erode,push"
+            t, e, p = (int(x) for x in os.environ["VGEO_OCCLUSION_CONFIG"].split(","))
+            _occlusion.config(t, e, p)
+    occ = _occlusion
+    cam = np.array(view.inverted().translation, dtype=np.float64)
+    occ.begin(np.array(window @ view, dtype=np.float32), cam, clip_start)
+    planes = np.array(stream._frustum_planes(window @ view), dtype=np.float64)
+    cands = []
+    for inst in insts:
+        if inst.vgeo_inst.source is None:
+            continue
+        tr, sc = copy_transforms(inst)
+        c = tr[:, :, 3].astype(np.float64)
+        r = float(inst.get("vgeo_radius", 1.0)) * sc
+        inside = np.all(c @ planes[:, :3].T + planes[:, 3] >= -r[:, None], axis=1)
+        d = np.linalg.norm(c - cam, axis=1) - r
+        idx = np.nonzero(inside)[0]
+        cands += [(float(d[i]), inst, int(i)) for i in idx[np.argsort(d[idx])][:OCCLUDER_COPIES]]
+    cands.sort(key=lambda x: x[0])
+    cands = cands[:OCCLUDER_COPIES]
+    by_inst = {}
+    for _d, inst, i in cands:
+        by_inst.setdefault(inst.name, (inst, []))[1].append(i)
+    for inst, idx in by_inst.values():
+        tr, sc = copy_transforms(inst)
+        occ.add(_atom_asset(inst), tr[idx], sc[idx], pixel_error=float(os.environ.get("VGEO_OCCLUDER_ERROR", 1.0)),
+                max_triangles=OCCLUDER_TRIANGLES)
+    occ.finish()
+    return occ
+
+
+def prepare_occlusion(insts, views):
+    """Before a tick's or render's instancer updates: one occlusion buffer for all of them."""
+    global _occlusion_current
+    users = [i for i in insts if getattr(i.vgeo_inst, "use_atoms", False) and getattr(i.vgeo_inst, "use_occlusion", False)]
+    _occlusion_current = build_occlusion(insts, views) if users else None
+    return _occlusion_current
+
+
+def select_atoms(inst, asset, views, pixel_error, mode=None, offscreen_scale=None, transforms=None,
+                 occlusion=False):
+    """A meshlet cut on every copy in one native call: ((m, 2) uint32 (copy, atom) pairs, stats).
+    occlusion: a native.Occlusion, or True for this tick's (prepare_occlusion), False for none."""
     vi = inst.vgeo_inst
     mode = mode or getattr(vi, "offscreen", "COARSEN")
     offscreen_scale = offscreen_scale or getattr(vi, "offscreen_scale", 8.0)
     tr, sc = transforms if transforms is not None else copy_transforms(inst)
     lights = native_lights(_scene_of(inst), getattr(vi, "shadow_distance", 0.0)) if mode == "SHADOWS" else []
+    if occlusion is True:
+        occlusion = _occlusion_current if getattr(vi, "use_occlusion", False) else None
     return asset.select_instances(world_views(views, pixel_error), tr, sc, mode=mode,
-                                  offscreen_scale=offscreen_scale, lights=lights)
+                                  offscreen_scale=offscreen_scale, lights=lights, occlusion=occlusion or None)
 
 
 def _clear_fronts(ob):
@@ -834,54 +898,94 @@ def create_instancer(context, source, surface, count, seed=0, scale_range=(0.7, 
 # ---------------------------------------------------------------- meshlet instancing (cut atoms)
 #
 # Every copy shows its own meshlet cut, made of instanced atoms: an atom is the set of clusters sharing
-# a (group, refined) pair, so it is always in or out of the cut as a whole. Each atom is built once as
-# a small mesh; every update the native runtime selects (copy, atom) pairs for all copies in one call.
+# a (group, refined) pair, so it is always in or out of the cut as a whole. Every update the native
+# runtime selects (copy, atom) pairs for all copies in one call.
 #
-# The atoms are split into slices of ATOM_SLICE, each with its own collection and its own point cloud
-# (a mesh object parented to the instancer, one point per pair whose atom is in the slice: the copy's
-# placement and the atom's index within the slice). Geometry Nodes instances the slice's atom meshes on
-# its points. A Geometry Nodes evaluation costs in proportion to the collection it reads, so small
-# slices keep each evaluation cheap, and an update rewrites only the clouds whose pairs changed.
+# Blender side (measured in the phase 2 spike): atoms must not be objects (every depsgraph update of a
+# scene with thousands of objects pays for them), and a Geometry Nodes evaluation costs in proportion
+# to the instance library it reads. So the atoms are split into slices of ATOM_SLICE. Each slice is one
+# mesh (its atoms side by side, a face attribute holding the atom's index in the slice) on a library
+# object whose Split to Instances makes one instance per atom, evaluated once. Each slice has a point
+# cloud parented to the instancer (one point per pair: the copy's placement, the atom's index) whose
+# Object Info + Instance on Points (Pick Instance) instances the library. An update rewrites only the
+# clouds whose pairs changed; clouds keep spare points (atom -1, left out) so most writes keep the size.
 
 ATOM_ATTR = "vgeo_atom"
+ATOM_FACE_ATTR = "vgeo_atom_local"
 ATOMS_NODE_GROUP = "VGEO Atoms"
-ATOM_SLICE = 256
+LIBRARY_NODE_GROUP = "VGEO Atom Library"
+ATOM_SLICE = 512
 SLICE_PROP = "vgeo_atom_slice"   # on a cloud object: its slice index
+LIB_PROP = "vgeo_atom_library"   # on a library object: its slice index
+
+ATOM_MOVING_INTERVAL = float(os.environ.get("VGEO_ATOM_INTERVAL", 0.2))   # seconds between viewport cut
+                                                                         # updates while the view moves
+
+# What drawing one more instance costs, in triangles: EEVEE spends ~2 us per instance per frame
+# (phase 2 spike), about what it spends on 300 triangles. In the viewport each copy is drawn as its
+# atoms or as one whole level mesh, whichever costs less by this measure.
+INSTANCE_COST = float(os.environ.get("VGEO_INSTANCE_COST", 300))
 
 _atom_assets = {}   # instancer uid -> native.Asset (own handle, memory-mapped)
 _atom_state = {}    # (instancer uid, slice) -> last pairs written to that cloud
+_atom_clouds = {}   # instancer uid -> {slice: cloud object}, checked by _ensure_clouds
+_atom_pace = {}     # instancer uid -> [time of last update, views key then, views key seen last tick]
+
+
+def _named(ng, name, kind):
+    a = ng.nodes.new("GeometryNodeInputNamedAttribute")
+    a.data_type = kind
+    a.inputs["Name"].default_value = name
+    return a
+
+
+def ensure_library_node_group():
+    ng = bpy.data.node_groups.get(LIBRARY_NODE_GROUP)
+    if ng and ng.bl_idname == "GeometryNodeTree":
+        return ng
+    ng = bpy.data.node_groups.new(LIBRARY_NODE_GROUP, "GeometryNodeTree")
+    ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    gin = ng.nodes.new("NodeGroupInput")
+    split = ng.nodes.new("GeometryNodeSplitToInstances")
+    split.domain = 'FACE'
+    ng.links.new(gin.outputs["Geometry"], split.inputs["Geometry"])
+    ng.links.new(_named(ng, ATOM_FACE_ATTR, 'INT').outputs["Attribute"], split.inputs["Group ID"])
+    out = ng.nodes.new("NodeGroupOutput")
+    ng.links.new(split.outputs["Instances"], out.inputs["Geometry"])
+    return ng
 
 
 def ensure_atoms_node_group():
     ng = bpy.data.node_groups.get(ATOMS_NODE_GROUP)
-    if ng and ng.bl_idname == "GeometryNodeTree" and "Atoms" in ng.interface.items_tree:
+    if ng and ng.bl_idname == "GeometryNodeTree" and "Library" in ng.interface.items_tree:
         return ng
+    if ng is not None:
+        ng.name = ATOMS_NODE_GROUP + " (old)"
     ng = bpy.data.node_groups.new(ATOMS_NODE_GROUP, "GeometryNodeTree")
     ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
-    ng.interface.new_socket("Atoms", in_out="INPUT", socket_type="NodeSocketCollection")
+    ng.interface.new_socket("Library", in_out="INPUT", socket_type="NodeSocketObject")
     ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
     n, L = ng.nodes, ng.links
     gin = n.new("NodeGroupInput")
-    info = n.new("GeometryNodeCollectionInfo")
+    info = n.new("GeometryNodeObjectInfo")
     info.transform_space = "ORIGINAL"
-    info.inputs["Separate Children"].default_value = True
-    info.inputs["Reset Children"].default_value = True
-    L.new(gin.outputs["Atoms"], info.inputs["Collection"])
-
-    def named(name, kind):
-        a = n.new("GeometryNodeInputNamedAttribute")
-        a.data_type = kind
-        a.inputs["Name"].default_value = name
-        return a
-
-    idx = named(ATOM_ATTR, 'INT')
-    rot = named(ROT_ATTR, 'FLOAT_VECTOR')
-    scl = named(SCALE_ATTR, 'FLOAT')
+    L.new(gin.outputs["Library"], info.inputs["Object"])
+    idx = _named(ng, ATOM_ATTR, 'INT')
+    rot = _named(ng, ROT_ATTR, 'FLOAT_VECTOR')
+    scl = _named(ng, SCALE_ATTR, 'FLOAT')
     e2r = n.new("FunctionNodeEulerToRotation")
     L.new(rot.outputs["Attribute"], e2r.inputs[0])
+    used = n.new("FunctionNodeCompare")   # spare points carry atom -1
+    used.data_type = 'INT'
+    used.operation = 'GREATER_EQUAL'
+    a_in, b_in = [x for x in used.inputs if x.type == 'INT'][:2]
+    b_in.default_value = 0
+    L.new(idx.outputs["Attribute"], a_in)
     iop = n.new("GeometryNodeInstanceOnPoints")
     L.new(gin.outputs["Geometry"], iop.inputs["Points"])
-    L.new(info.outputs["Instances"], iop.inputs["Instance"])
+    L.new(used.outputs[0], iop.inputs["Selection"])
+    L.new(info.outputs["Geometry"], iop.inputs["Instance"])
     iop.inputs["Pick Instance"].default_value = True
     L.new(idx.outputs["Attribute"], iop.inputs["Instance Index"])
     L.new(e2r.outputs[0], iop.inputs["Rotation"])
@@ -905,14 +1009,16 @@ def close_atom_assets():
         a.close()
     _atom_assets.clear()
     _atom_state.clear()
+    _atom_clouds.clear()
+    _atom_pace.clear()
 
 
-def atom_slices(inst):
-    """The per-slice atom collections, in slice order."""
+def atom_libraries(inst):
+    """{slice: library object} of an instancer."""
     col = inst.vgeo_inst.atoms
     if col is None:
-        return []
-    return sorted(col.children, key=lambda c: c.name)
+        return {}
+    return {int(o[LIB_PROP]): o for o in col.objects if LIB_PROP in o}
 
 
 def atom_clouds(inst):
@@ -920,9 +1026,41 @@ def atom_clouds(inst):
     return {int(o[SLICE_PROP]): o for o in inst.children if SLICE_PROP in o}
 
 
+def _concat(parts):
+    out = {k: [] for k in ("positions", "normals", "uvs", "corner_verts", "face_materials", "face_lod",
+                           "edge_verts", "corner_edges")}
+    v_off = e_off = 0
+    for d in parts:
+        out["positions"].append(d["positions"])
+        out["normals"].append(d["normals"])
+        if d["uvs"] is not None:
+            out["uvs"].append(d["uvs"])
+        out["corner_verts"].append(d["corner_verts"] + v_off)
+        out["face_materials"].append(d["face_materials"])
+        out["face_lod"].append(d["face_lod"])
+        out["edge_verts"].append(d["edge_verts"] + v_off)
+        out["corner_edges"].append(d["corner_edges"] + e_off)
+        v_off += d["vertex_count"]
+        e_off += d["edge_count"]
+    res = {k: (np.concatenate(v) if v else None) for k, v in out.items()}
+    if len(out["uvs"]) != len(parts):
+        res["uvs"] = None
+    res["vertex_count"], res["edge_count"], res["tri_count"] = v_off, e_off, len(res["face_materials"])
+    return res
+
+
+def _remove_objects(obs):
+    for ob in list(obs):
+        me = ob.data
+        bpy.data.objects.remove(ob)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+
+
 def build_atoms(inst):
-    """Build one mesh per cut atom of the instancer's asset, ATOM_SLICE per collection (only Geometry
-    Nodes reads them; named by index, as Collection Info sorts children by name)."""
+    """Build the instancer's atom libraries: one mesh per slice of ATOM_SLICE atoms, with the atom's
+    index in the slice as a face attribute, on a library object (in a collection only Geometry Nodes
+    reads) that splits it into one instance per atom."""
     vi = inst.vgeo_inst
     uid = vi.uid
     asset = _atom_asset(inst)
@@ -931,34 +1069,38 @@ def build_atoms(inst):
     if col is None:
         col = bpy.data.collections.new(f".vgeo atoms {uid}")
         vi.atoms = col
-    for sub in list(col.children) + [col]:   # previous build
-        for ob in list(sub.objects):
-            me = ob.data
-            bpy.data.objects.remove(ob)
-            if me is not None and me.users == 0:
-                bpy.data.meshes.remove(me)
-        if sub is not col:
-            bpy.data.collections.remove(sub)
-    for ob in atom_clouds(inst).values():
-        me = ob.data
-        bpy.data.objects.remove(ob)
-        if me is not None and me.users == 0:
-            bpy.data.meshes.remove(me)
+    for sub in list(col.children):   # an older layout: object per atom, collection per slice
+        _remove_objects(sub.objects)
+        bpy.data.collections.remove(sub)
+    _remove_objects(col.objects)
+    _remove_objects(atom_clouds(inst).values())
     materials = tuple(vi.source.data.materials)
-    sub = None
-    for k in range(len(atoms)):
-        if k % ATOM_SLICE == 0:
-            sub = bpy.data.collections.new(f".vgeo atoms {uid} s{k // ATOM_SLICE:04d}")
-            col.children.link(sub)
-        name = f"vgeo.{uid}.A{k:05d}"
+    lib_ng = ensure_library_node_group()
+    for k in range(-(-len(atoms) // ATOM_SLICE)):
+        lo, hi = k * ATOM_SLICE, min(len(atoms), (k + 1) * ATOM_SLICE)
+        parts, local = [], []
+        for a in range(lo, hi):
+            d = asset.extract_atom(a)
+            if d is None:   # every cluster corrupt (reported by the asset): later indices would shift
+                continue
+            parts.append(d)
+            local.append(np.full(d["tri_count"], a - lo, np.int32))
+        name = f"vgeo.{uid}.atoms{k:03d}"
         me = bpy.data.meshes.new(name)
         stream._sync_materials(me, materials)
-        stream.fill_mesh(me, asset.extract_atom(k), materials, False)
+        data = _concat(parts)
+        stream.fill_mesh(me, data, materials, False)
+        me.attributes.new(ATOM_FACE_ATTR, 'INT', 'FACE').data.foreach_set("value", np.concatenate(local))
         ob = bpy.data.objects.new(name, me)
-        sub.objects.link(ob)
+        ob[LIB_PROP] = k
+        mod = ob.modifiers.new("VGEO Atom Library", 'NODES')
+        mod.node_group = lib_ng
+        col.objects.link(ob)
     inst["vgeo_atom_tris"] = [int(t) for t in atoms["tri_count"]]
     for key in [k for k in _atom_state if k[0] == uid]:
         del _atom_state[key]
+    _atom_clouds.pop(uid, None)
+    _atom_pace.pop(uid, None)
     return len(atoms)
 
 
@@ -968,7 +1110,7 @@ def _ensure_clouds(inst):
     ng = ensure_atoms_node_group()
     have = atom_clouds(inst)
     out = {}
-    for k, sub in enumerate(atom_slices(inst)):
+    for k, lib in sorted(atom_libraries(inst).items()):
         ob = have.get(k)
         if ob is None:
             name = f"{inst.name} Atoms {k:03d}"
@@ -976,9 +1118,13 @@ def _ensure_clouds(inst):
             ob[SLICE_PROP] = k
             ob.parent = inst
             ob.hide_select = True
+        mod = next((m for m in ob.modifiers if m.type == 'NODES'), None)
+        if mod is None:
             mod = ob.modifiers.new("VGEO Atoms", 'NODES')
+        if mod.node_group != ng:
             mod.node_group = ng
-            mod[_socket_id(ng, "Atoms")] = sub
+        if mod[_socket_id(ng, "Library")] != lib:
+            mod[_socket_id(ng, "Library")] = lib
         for col in inst.users_collection:
             if ob.name not in col.objects:
                 col.objects.link(ob)
@@ -996,7 +1142,7 @@ def set_use_atoms(inst, on):
         if not native.has_atoms():
             print("VGEO: this build of the native library has no cut atoms")
             return
-        if vi.atoms is None or not len(vi.atoms.children):
+        if vi.atoms is None or not atom_libraries(inst):
             build_atoms(inst)
         _ensure_clouds(inst)
         flags = _streamed_flags(inst)   # streamed copies are not needed: every copy is cut
@@ -1009,33 +1155,70 @@ def set_use_atoms(inst, on):
             ob.hide_viewport = ob.hide_render = True
         for key in [k for k in _atom_state if k[0] == vi.uid]:
             del _atom_state[key]
+    _atom_clouds.pop(vi.uid, None)
+    _atom_pace.pop(vi.uid, None)
+
+
+def _cloud_attr(me, name, kind):
+    a = me.attributes.get(name)
+    if a is None or a.domain != 'POINT' or a.data_type != kind:
+        if a is not None:
+            me.attributes.remove(a)
+        a = me.attributes.new(name, kind, 'POINT')
+    return a
 
 
 def _write_cloud(ob, copy, local, co, rot, scale):
-    pm = ob.data
-    pm.clear_geometry()
+    """Write one cloud's points. The point count only grows (by half again when it must); spare
+    points get atom -1, which the node group leaves out, so most writes keep the mesh's size."""
+    me = ob.data
     m = len(copy)
-    if m:
-        pm.vertices.add(m)
-        pm.vertices.foreach_set("co", np.ascontiguousarray(co[copy]).ravel())
-        pm.attributes.new(ATOM_ATTR, 'INT', 'POINT').data.foreach_set("value", local)
-        pm.attributes.new(ROT_ATTR, 'FLOAT_VECTOR', 'POINT').data.foreach_set(
-            "vector", np.ascontiguousarray(rot[copy]).ravel())
-        pm.attributes.new(SCALE_ATTR, 'FLOAT', 'POINT').data.foreach_set("value", np.ascontiguousarray(scale[copy]))
-    pm.update()
+    cap = len(me.vertices)
+    if m > cap or cap > 4 * max(m, 64):
+        me.clear_geometry()
+        cap = max(64, int(m * 1.5))
+        me.vertices.add(cap)
+    pos = np.zeros((cap, 3), np.float32)
+    rt = np.zeros((cap, 3), np.float32)
+    sc = np.ones(cap, np.float32)
+    idx = np.full(cap, -1, np.int32)
+    pos[:m] = co[copy]
+    rt[:m] = rot[copy]
+    sc[:m] = scale[copy]
+    idx[:m] = local
+    me.vertices.foreach_set("co", pos.ravel())
+    _cloud_attr(me, ATOM_ATTR, 'INT').data.foreach_set("value", idx)
+    _cloud_attr(me, ROT_ATTR, 'FLOAT_VECTOR').data.foreach_set("vector", rt.ravel())
+    _cloud_attr(me, SCALE_ATTR, 'FLOAT').data.foreach_set("value", sc)
+    me.update()
+
+
+def _clouds_fast(inst):
+    """The instancer's clouds, re-checked in full only when one was deleted or the set is unknown."""
+    uid = inst.vgeo_inst.uid
+    clouds = _atom_clouds.get(uid)
+    if clouds is not None:
+        try:
+            if all(not ob.hide_viewport and ob.parent == inst for ob in clouds.values()):
+                return clouds
+        except ReferenceError:
+            pass
+    clouds = _ensure_clouds(inst)
+    _atom_clouds[uid] = clouds
+    return clouds
 
 
 def _write_atom_points(inst, pairs):
     """Route the (copy, atom) pairs to their slices' clouds; rewrite only the clouds that changed.
     Returns the number of clouds rewritten."""
     vi = inst.vgeo_inst
-    clouds = _ensure_clouds(inst)
+    clouds = _clouds_fast(inst)
     if not clouds:
         return 0
     sl = (pairs[:, 1] // ATOM_SLICE).astype(np.int64)
     order = np.argsort(sl, kind="stable")
     sp = pairs[order]
-    bounds = np.searchsorted(sl[order], np.arange(len(clouds) + 1))
+    bounds = np.searchsorted(sl[order], np.arange(max(clouds) + 2))
     data = None
     written = 0
     for k, ob in clouds.items():
@@ -1057,12 +1240,72 @@ def _write_atom_points(inst, pairs):
     return written
 
 
-def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None):
-    """Meshlet instancing update: one native selection for every copy, then rewrite changed clouds."""
+def _views_key(inst, views, pixel_error, mode, offscreen_scale):
+    """What the cut depends on: the views, settings, placements, the instancer's transform, lamps."""
+    co, scale = _points(inst)
+    a = inst.data.attributes.get(ROT_ATTR)
+    rot = np.zeros(len(co) * 3, np.float32)
+    if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
+        a.data.foreach_get("vector", rot)
+    parts = [round(pixel_error, 4), mode, round(offscreen_scale or 0, 3),
+             hash(co.tobytes()), hash(scale.tobytes()), hash(rot.tobytes()),
+             tuple(round(x, 6) for row in inst.matrix_world for x in row)]
+    if mode == "SHADOWS":
+        suns, local = shadow_lights(_scene_of(inst))
+        parts.append(tuple(tuple(np.round(d, 5)) for d in suns))
+        parts.append(tuple((tuple(np.round(p, 4)), round(r, 4)) for p, r, _a, _h in local))
+    for view, window, height, persp, clip_start in views:
+        parts.append(tuple(round(x, 5) for row in view for x in row))
+        parts.append(tuple(round(x, 5) for row in window for x in row))
+        parts.append(height)
+    return tuple(parts)
+
+
+def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, paced=False):
+    """Meshlet instancing update: one native selection for every copy, then rewrite changed clouds.
+
+    paced (the live loop): a moving view gets a new cut at most every ATOM_MOVING_INTERVAL (each
+    update costs EEVEE a re-sync of the changed clouds and their shadows); once the view stops, the
+    cut for where it stopped lands on the next tick. Unpaced calls (final renders, scripts) cut now."""
+    uid = inst.vgeo_inst.uid
+    if paced:
+        key = _views_key(inst, views, pixel_error, mode, offscreen_scale)
+        pace = _atom_pace.get(uid)
+        now = time.perf_counter()
+        if pace is not None:
+            if key == pace[1]:
+                pace[2] = key
+                return False   # this view's cut is already shown
+            moving = key != pace[2]
+            pace[2] = key
+            if moving and now - pace[0] < ATOM_MOVING_INTERVAL:
+                return False
+        _atom_pace[uid] = [now, key, key]
+    else:
+        _atom_pace.pop(uid, None)
     asset = _atom_asset(inst)
-    pairs, st = select_atoms(inst, asset, views, pixel_error, mode, offscreen_scale)
+    pairs, st = select_atoms(inst, asset, views, pixel_error, mode, offscreen_scale, occlusion=True)
+    n = len(inst.data.vertices)
+    levels = np.full(n, -1, np.int32)   # copies drawn as atoms show no level mesh
+    tris = int(st.triangles)
+    if paced and INSTANCE_COST > 0 and len(pairs):
+        # viewport: a copy whose atoms cost more (triangles plus instances) than its whole level
+        # mesh is drawn as the level mesh instead (final renders always draw atoms: fewer triangles)
+        atom_tris = np.asarray(inst.get("vgeo_atom_tris", []), np.int64)
+        if len(atom_tris):
+            lv, _budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
+            _errors, lvl_tris = _level_tables(inst)
+            c = pairs[:, 0].astype(np.int64)
+            a_tris = np.bincount(c, weights=atom_tris[pairs[:, 1]], minlength=n)
+            a_count = np.bincount(c, minlength=n)
+            l_tris = np.where(lv >= 0, lvl_tris[np.maximum(lv, 0)], 0)
+            use_level = (lv >= 0) & (a_count > 1) & (l_tris + INSTANCE_COST < a_tris + INSTANCE_COST * a_count)
+            if use_level.any():
+                levels[use_level] = lv[use_level]
+                keep = ~use_level[c]
+                tris = int(a_tris[~use_level].sum() + l_tris[use_level].sum())
+                pairs = pairs[keep]
     changed = _write_atom_points(inst, pairs) > 0
-    levels = np.full(len(inst.data.vertices), -1, np.int32)   # the level path shows nothing
     changed |= apply_levels(inst, levels)
-    inst.vgeo_inst.shown_triangles = int(min(st.triangles, 2**31 - 1))
+    inst.vgeo_inst.shown_triangles = int(min(tris, 2**31 - 1))
     return changed

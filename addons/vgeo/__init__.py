@@ -71,6 +71,10 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
         description="Experimental: draw every copy as its own meshlet cut, made of instanced pieces of the "
                     "asset (cut atoms) that never change, instead of whole-asset levels and streamed copies",
         update=lambda self, ctx: instances.set_use_atoms(self.id_data, self.use_atoms))
+    use_occlusion: BoolProperty(
+        name="Occlusion Culling", default=False,
+        description="With Meshlet Instancing: leave out copies and pieces hidden behind the nearest copies "
+                    "(in Shadows mode only when their shadow is hidden too)")
     atoms: PointerProperty(type=bpy.types.Collection, name="Atoms")
     atom_points: PointerProperty(type=bpy.types.Object, name="Atom Points")
     pixel_error: FloatProperty(name="Viewport Error", default=1.0, min=0.1, soft_max=8.0, subtype='PIXEL')
@@ -368,6 +372,8 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.prop(vi, "min_level")
             if native.has_atoms():
                 layout.prop(vi, "use_atoms")
+                if vi.use_atoms and native.has_occlusion():
+                    layout.prop(vi, "use_occlusion")
             if not vi.use_atoms:
                 layout.prop(vi, "stream_slots")
             layout.prop(vi, "offscreen")

@@ -815,9 +815,10 @@ def update_for_render(scene, depsgraph=None):
     from . import instances
     # instancers first: they choose which copies get a streamed cut and make it now
     with instances.tick_scope():
-        for inst in instances.instancers(scene):
-            if not inst.hide_render:
-                instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
+        insts = [i for i in instances.instancers(scene) if not i.hide_render]
+        instances.prepare_occlusion(insts, [view])
+        for inst in insts:
+            instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
     for obj in proxies(scene):
         if obj.vgeo.collection is not None:
             sync_visibility(obj)
@@ -877,10 +878,13 @@ def _tick():
         if not views:
             return 0.25
         with instances.tick_scope():
+            if any(getattr(i.vgeo_inst, "use_atoms", False) and getattr(i.vgeo_inst, "use_occlusion", False)
+                   for i in insts):
+                instances.prepare_occlusion([i for i in insts if vl is None or i.visible_get(view_layer=vl)], views)
             for inst in insts:   # per-placement level choice: cheap, no geometry is rebuilt
                 try:
                     if vl is None or inst.visible_get(view_layer=vl):
-                        instances.update(inst, views, inst.vgeo_inst.pixel_error)
+                        instances.update(inst, views, inst.vgeo_inst.pixel_error, paced=True)
                 except RuntimeError:
                     continue
         if not objs:

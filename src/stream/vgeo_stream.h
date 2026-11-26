@@ -233,8 +233,32 @@ typedef struct vgeo_instances_stats {
 VGEO_API int vgeo_select_instances(void* handle, const vgeo_view* views, int view_count,
                                    const float* transforms, const float* scales, const uint8_t* copy_mask,
                                    int copy_count, int mode, float offscreen_scale,
-                                   const vgeo_shadow_light* lights, int light_count,
+                                   const vgeo_shadow_light* lights, int light_count, const void* occlusion,
                                    uint32_t* out_pairs, uint32_t max_pairs, vgeo_instances_stats* stats);
+
+// ---------------------------------------------------------------- occlusion culling
+//
+// A small CPU depth buffer of coarse occluders (the nearest copies' uniform levels, pushed away from
+// the camera by their simplification error and eroded by a pixel, so it never claims more than the
+// real surfaces hide) and a max-depth pyramid. Passed to vgeo_select_instances (single view only):
+// hidden copies are dropped in Cull, coarsened in Coarsen, and in Shadows kept (coarsened) while their
+// sun shadow volume or a lamp in range may still show; hidden atoms are dropped in Cull and Shadows.
+VGEO_API void* vgeo_occlusion_new(int width, int height);
+VGEO_API void vgeo_occlusion_free(void* occlusion);
+// for experiments: triangles per occluder copy (0 = keep, default 6000), erosion and error push (1/0)
+VGEO_API int vgeo_occlusion_config(void* occlusion, uint64_t copy_triangles, int erode, int push);
+// view_proj: world -> clip, 16 floats row-major; camera: world position; znear: near distance
+VGEO_API int vgeo_occlusion_begin(void* occlusion, const float* view_proj, const float* camera, float znear);
+// Rasterize copies of an asset (nearest first: stops past max_triangles in total, 0 = no limit), each at
+// the coarsest level within pixel_error pixels of the buffer (at most a few thousand triangles a copy).
+VGEO_API int vgeo_occlusion_add(void* occlusion, void* handle, const float* transforms, const float* scales,
+                                int count, float pixel_error, uint64_t max_triangles, uint64_t* out_triangles);
+VGEO_API int vgeo_occlusion_finish(void* occlusion);
+// 1 per sphere hidden behind the occluders (after finish)
+VGEO_API int vgeo_occlusion_test(void* occlusion, const float* centers, const float* radii, int count,
+                                 uint8_t* out_occluded);
+// the eroded depth buffer (width * height floats, view distance, FLT_MAX = empty), for debugging
+VGEO_API int vgeo_occlusion_depth(void* occlusion, float* out);
 
 VGEO_API int vgeo_version(void);
 
