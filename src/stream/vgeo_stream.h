@@ -180,6 +180,62 @@ VGEO_API int vgeo_export_web(void* handle, const char* path_utf8, uint64_t* out_
 VGEO_API int vgeo_export_web_paged(void* handle, const char* path_utf8, uint32_t page_vertices,
                                    uint64_t* out_bytes, char* err, int err_len);
 
+// ---------------------------------------------------------------- cut atoms and many copies
+
+// An atom is the set of clusters sharing a (group, refined) pair. The cut rule tests only those
+// two groups, so an atom is always in or out of the cut as a whole: a fixed piece of the asset at
+// a fixed detail. Copies of an asset can be drawn as instances of atom meshes that never change.
+typedef struct vgeo_atom {
+    int32_t group;                // group its clusters belong to
+    int32_t refined;              // group they were simplified from, -1 = original geometry
+    uint32_t cluster_offset;      // into vgeo_atom_clusters
+    uint32_t cluster_count;
+    uint32_t tri_count;
+    uint32_t depth;               // DAG depth of `group`
+    float center[3];              // bounds enclosing its clusters' bounds
+    float radius;
+} vgeo_atom;
+
+// Number of atoms; writes min(max_atoms, count) atoms to out (out may be NULL).
+VGEO_API int vgeo_atoms(void* handle, vgeo_atom* out, int max_atoms);
+
+// Extract one atom as an indexed mesh (same layout as vgeo_extract; valid until the next extract).
+VGEO_API int vgeo_extract_atom(void* handle, uint32_t atom, vgeo_chunk_data* out);
+
+// Lights that let copies outside the view stay, because their shadow can reach it (Shadows mode).
+typedef struct vgeo_shadow_light {
+    int32_t kind;                 // 0 = sun (dir), 1 = point or spot (pos, range, axis, cos_half)
+    float dir[3];                 // sun: unit direction its light travels
+    float reach;                  // sun: how far a shadow reaches along dir; <= 0 = 2 r / max(-dir.z, 0.1)
+    float pos[3];
+    float range;
+    float axis[3];                // spot axis (unit); ignored when half_angle >= pi/2
+    float half_angle;             // pi for point lights
+} vgeo_shadow_light;
+
+enum { VGEO_OFFSCREEN_FULL = 0, VGEO_OFFSCREEN_COARSEN = 1, VGEO_OFFSCREEN_CULL = 2,
+       VGEO_OFFSCREEN_SHADOWS = 3 };
+
+typedef struct vgeo_instances_stats {
+    uint64_t triangles;           // over every pair written
+    uint32_t pairs;               // pairs needed (may exceed max_pairs: then nothing past it is written)
+    uint32_t copies_drawn;        // copies with at least one atom
+} vgeo_instances_stats;
+
+// Select the cut of every copy of the asset in one call and return (copy, atom) pairs, copy-major.
+// views are in WORLD space (camera, planes) with the asset's units (threshold as in vgeo_view;
+// frustum_mode and offscreen_scale of the views are ignored: `mode` and `offscreen_scale` apply).
+// transforms: n * 12 floats, row-major 3x4 local-to-world matrices; scales: n uniform scales
+// (how the matrix scales lengths; errors and radii are multiplied by it). copy_mask (n bytes, or
+// NULL) skips copies whose byte is 0. Modes: FULL ignores the frustum; COARSEN uses
+// threshold * offscreen_scale for groups outside every view; CULL drops atoms outside every view;
+// SHADOWS is CULL, except atoms whose shadow from `lights` can reach a view are kept (coarsened).
+VGEO_API int vgeo_select_instances(void* handle, const vgeo_view* views, int view_count,
+                                   const float* transforms, const float* scales, const uint8_t* copy_mask,
+                                   int copy_count, int mode, float offscreen_scale,
+                                   const vgeo_shadow_light* lights, int light_count,
+                                   uint32_t* out_pairs, uint32_t max_pairs, vgeo_instances_stats* stats);
+
 VGEO_API int vgeo_version(void);
 
 #ifdef __cplusplus

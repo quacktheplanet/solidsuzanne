@@ -100,6 +100,42 @@ class ChunkData(ctypes.Structure):
     ]
 
 
+class Atom(ctypes.Structure):
+    _fields_ = [
+        ("group", ctypes.c_int32),
+        ("refined", ctypes.c_int32),
+        ("cluster_offset", ctypes.c_uint32),
+        ("cluster_count", ctypes.c_uint32),
+        ("tri_count", ctypes.c_uint32),
+        ("depth", ctypes.c_uint32),
+        ("center", ctypes.c_float * 3),
+        ("radius", ctypes.c_float),
+    ]
+
+
+class ShadowLight(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_int32),
+        ("dir", ctypes.c_float * 3),
+        ("reach", ctypes.c_float),
+        ("pos", ctypes.c_float * 3),
+        ("range", ctypes.c_float),
+        ("axis", ctypes.c_float * 3),
+        ("half_angle", ctypes.c_float),
+    ]
+
+
+class InstancesStats(ctypes.Structure):
+    _fields_ = [
+        ("triangles", ctypes.c_uint64),
+        ("pairs", ctypes.c_uint32),
+        ("copies_drawn", ctypes.c_uint32),
+    ]
+
+
+OFFSCREEN_MODES = {"FULL": 0, "COARSEN": 1, "CULL": 2, "SHADOWS": 3}
+
+
 PROGRESS_FN = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_float)
 
 
@@ -112,7 +148,8 @@ def _library_name():
 
 
 def library_path():
-    return os.path.join(os.path.dirname(__file__), "bin", _library_name())
+    # VGEO_STREAM_LIB points at another build of the library (development)
+    return os.environ.get("VGEO_STREAM_LIB") or os.path.join(os.path.dirname(__file__), "bin", _library_name())
 
 
 def lib():
@@ -156,8 +193,24 @@ def lib():
         L.vgeo_export_web_paged.argtypes = [c.c_void_p, c.c_char_p, c.c_uint32, c.POINTER(c.c_uint64),
                                             c.c_char_p, c.c_int]
         L.vgeo_export_web_paged.restype = c.c_int
+    if hasattr(L, "vgeo_select_instances"):  # cut atoms: one call selects every copy
+        L.vgeo_atoms.argtypes = [c.c_void_p, c.c_void_p, c.c_int]
+        L.vgeo_atoms.restype = c.c_int
+        L.vgeo_extract_atom.argtypes = [c.c_void_p, c.c_uint32, c.POINTER(ChunkData)]
+        L.vgeo_extract_atom.restype = c.c_int
+        L.vgeo_select_instances.argtypes = [c.c_void_p, c.POINTER(View), c.c_int, c.c_void_p, c.c_void_p,
+                                            c.c_void_p, c.c_int, c.c_int, c.c_float, c.c_void_p, c.c_int,
+                                            c.c_void_p, c.c_uint32, c.POINTER(InstancesStats)]
+        L.vgeo_select_instances.restype = c.c_int
     _lib = L
     return L
+
+
+def has_atoms():
+    try:
+        return hasattr(lib(), "vgeo_select_instances")
+    except RuntimeError:
+        return False
 
 
 def available():
@@ -364,34 +417,85 @@ class Asset:
             raise RuntimeError(err.value.decode("utf-8", "replace") or "vgeo_export_web failed")
         return size.value
 
+    def atoms(self):
+        """Structured array of the asset's cut atoms (group, refined, tri_count, depth, center, radius)."""
+        L = lib()
+        n = L.vgeo_atoms(self._h, None, 0)
+        arr = (Atom * max(1, n))()
+        L.vgeo_atoms(self._h, ctypes.byref(arr), n)
+        dt = np.dtype([("group", np.int32), ("refined", np.int32), ("cluster_offset", np.uint32),
+                       ("cluster_count", np.uint32), ("tri_count", np.uint32), ("depth", np.uint32),
+                       ("center", np.float32, 3), ("radius", np.float32)])
+        out = np.frombuffer(bytes(arr), dtype=dt, count=n).copy()
+        return out
+
+    def extract_atom(self, atom):
+        """Numpy copies of one atom's geometry (None if empty)."""
+        d = ChunkData()
+        if lib().vgeo_extract_atom(self._h, int(atom), ctypes.byref(d)) != 0:
+            raise RuntimeError("vgeo_extract_atom failed")
+        return _chunk_arrays(d)
+
+    def select_instances(self, views, transforms, scales, mode="COARSEN", offscreen_scale=8.0, lights=(),
+                         mask=None, pairs=None):
+        """Cut of every copy in one call. views: world-space View list; transforms: (n, 3, 4) float32
+        local-to-world; scales: (n,) float32. Returns ((m, 2) uint32 (copy, atom) pairs, InstancesStats)."""
+        L = lib()
+        tr = np.ascontiguousarray(transforms, dtype=np.float32).reshape(-1, 12)
+        sc = np.ascontiguousarray(scales, dtype=np.float32).ravel()
+        n = len(sc)
+        mk = None if mask is None else np.ascontiguousarray(mask, dtype=np.uint8)
+        varr = (View * len(views))(*views)
+        larr = (ShadowLight * max(1, len(lights)))(*lights) if lights else None
+        stats = InstancesStats()
+        if pairs is None or len(pairs) == 0:
+            pairs = np.empty((max(1024, n * 64), 2), dtype=np.uint32)
+        for _attempt in range(2):
+            rc = L.vgeo_select_instances(self._h, varr, len(views), _ptr(tr), _ptr(sc), _ptr(mk), n,
+                                         OFFSCREEN_MODES[mode], float(offscreen_scale),
+                                         ctypes.byref(larr) if larr is not None else None, len(lights),
+                                         _ptr(pairs), len(pairs), ctypes.byref(stats))
+            if rc == 2:   # more pairs than room: grow and select again
+                pairs = np.empty((int(stats.pairs * 1.25) + 1024, 2), dtype=np.uint32)
+                continue
+            if rc != 0:
+                raise RuntimeError("vgeo_select_instances failed")
+            break
+        return pairs[:stats.pairs], stats
+
     def extract(self, chunk):
         """Return numpy copies of one chunk's selected geometry (None if empty)."""
         d = ChunkData()
         if lib().vgeo_extract(self._h, chunk, ctypes.byref(d)) != 0:
             raise RuntimeError("vgeo_extract failed")
-        nv, nt = d.vertex_count, d.tri_count
-        if nt == 0:
-            return None
+        return _chunk_arrays(d)
 
-        def grab(ptr, n, dtype):
-            # memmove into a fresh array: much cheaper than np.ctypeslib.as_array per call
-            out = np.empty(n, dtype=dtype)
-            ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
-            return out
 
-        return {
-            "positions": grab(d.positions, nv * 3, np.float32),
-            "normals": grab(d.normals, nv * 3, np.float32),
-            "uvs": grab(d.uvs, nv * 2, np.float32) if d.uvs else None,
-            "corner_verts": grab(d.corner_verts, nt * 3, np.int32),
-            "face_materials": grab(d.face_materials, nt, np.int32),
-            "face_lod": grab(d.face_lod, nt, np.int32),
-            "edge_verts": grab(d.edge_verts, d.edge_count * 2, np.int32),
-            "corner_edges": grab(d.corner_edges, nt * 3, np.int32),
-            "vertex_count": nv,
-            "tri_count": nt,
-            "edge_count": d.edge_count,
-        }
+def _chunk_arrays(d):
+    """Numpy copies of the arrays an extract call filled (None if empty)."""
+    nv, nt = d.vertex_count, d.tri_count
+    if nt == 0:
+        return None
+
+    def grab(ptr, n, dtype):
+        # memmove into a fresh array: much cheaper than np.ctypeslib.as_array per call
+        out = np.empty(n, dtype=dtype)
+        ctypes.memmove(out.ctypes.data, ctypes.cast(ptr, ctypes.c_void_p).value, out.nbytes)
+        return out
+
+    return {
+        "positions": grab(d.positions, nv * 3, np.float32),
+        "normals": grab(d.normals, nv * 3, np.float32),
+        "uvs": grab(d.uvs, nv * 2, np.float32) if d.uvs else None,
+        "corner_verts": grab(d.corner_verts, nt * 3, np.int32),
+        "face_materials": grab(d.face_materials, nt, np.int32),
+        "face_lod": grab(d.face_lod, nt, np.int32),
+        "edge_verts": grab(d.edge_verts, d.edge_count * 2, np.int32),
+        "corner_edges": grab(d.corner_edges, nt * 3, np.int32),
+        "vertex_count": nv,
+        "tri_count": nt,
+        "edge_count": d.edge_count,
+    }
 
 
 FRUSTUM_MODES = {"FULL": 0, "COARSEN": 1, "CULL": 2}

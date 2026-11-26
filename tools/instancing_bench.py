@@ -178,6 +178,16 @@ def main():
                    "runs": []}
             if not flag("--no-ideal"):
                 row["cut"], row["cut_cull"] = ideal(inst, assets[inst.name], view, err)
+            if native.has_atoms() and not flag("--no-atoms"):
+                # phase 2: a meshlet cut on every copy drawn as instanced atoms, per Off-screen mode
+                row["atoms"] = {}
+                tr = instances.copy_transforms(inst)
+                for mode in [m for m in modes if m] or ["COARSEN"]:
+                    t0 = time.perf_counter()
+                    _pairs, st = instances.select_atoms(inst, assets[inst.name], [view], err, mode=mode,
+                                                        transforms=tr)
+                    row["atoms"][mode] = {"triangles": int(st.triangles), "pairs": int(st.pairs),
+                                          "select_ms": round((time.perf_counter() - t0) * 1000, 2)}
             for mode in modes:
                 for slots in slot_counts:
                     if slots is not None:
@@ -204,8 +214,10 @@ def main():
     print("\nper camera (all instancers):")
     combos = [(r["offscreen"], r["slots"]) for r in rows[0]["runs"]]
     head = "".join(f"  shown[{m},{s}]".rjust(22) for m, s in combos)
+    amodes = list(rows[0].get("atoms", {}).keys())
+    head += "".join(f"atoms[{m}]".rjust(18) for m in amodes)
     print("cam".ljust(5) + head + "cut".rjust(14) + "cut+cull".rjust(14))
-    sums = {"cut": 0, "cut_cull": 0, **{c: 0 for c in combos}}
+    sums = {"cut": 0, "cut_cull": 0, **{c: 0 for c in combos}, **{("atoms", m): 0 for m in amodes}}
     for ci in range(n_cams):
         rs = [r for r in rows if r["camera"] == ci]
         line = str(ci).ljust(5)
@@ -213,20 +225,27 @@ def main():
             v = sum(r["runs"][k]["shown"] for r in rs)
             sums[c] += v / n_cams
             line += f"{v:,}".rjust(22)
+        for m in amodes:
+            v = sum(r["atoms"][m]["triangles"] for r in rs)
+            sums[("atoms", m)] += v / n_cams
+            line += f"{v:,}".rjust(18)
         for key in ("cut", "cut_cull"):
             v = sum(r.get(key, 0) for r in rs)
             sums[key] += v / n_cams
             line += f"{v:,}".rjust(14)
         print(line)
     line = "mean".ljust(5) + "".join(f"{int(sums[c]):,}".rjust(22) for c in combos)
+    line += "".join(f"{int(sums[('atoms', m)]):,}".rjust(18) for m in amodes)
     line += f"{int(sums['cut']):,}".rjust(14) + f"{int(sums['cut_cull']):,}".rjust(14)
     print(line)
     out = arg("--json")
     if out:
         with open(out, "w") as f:
             json.dump({"rows": rows, "mean": {f"{m},{s}": int(sums[(m, s)]) for m, s in combos} |
+                       {f"atoms,{m}": int(sums[("atoms", m)]) for m in amodes} |
                        {"cut": int(sums["cut"]), "cut_cull": int(sums["cut_cull"])}}, f, indent=1)
         print("wrote", out)
 
 
-main()
+if __name__ == "__main__":
+    main()

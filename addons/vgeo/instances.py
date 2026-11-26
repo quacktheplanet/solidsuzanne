@@ -571,6 +571,86 @@ def placement_matrix(inst, i):
     return Matrix.Translation(co) @ rot.to_matrix().to_4x4() @ Matrix.Diagonal((sc, sc, sc, 1.0))
 
 
+def copy_transforms(inst):
+    """World matrices of every placement as (n, 3, 4) float32 rows, and their uniform scales (n,)."""
+    co, scale = _points(inst)
+    n = len(co)
+    rot = np.zeros((n, 3), np.float32)
+    a = inst.data.attributes.get(ROT_ATTR)
+    if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
+        a.data.foreach_get("vector", rot.ravel())
+    x, y, z = (rot[:, k].astype(np.float64) for k in range(3))
+    cx, sx, cy, sy, cz, sz = np.cos(x), np.sin(x), np.cos(y), np.sin(y), np.cos(z), np.sin(z)
+    # Euler XYZ (Blender): R = Rz @ Ry @ Rx
+    R = np.empty((n, 3, 3))
+    R[:, 0, 0] = cz * cy
+    R[:, 0, 1] = cz * sy * sx - sz * cx
+    R[:, 0, 2] = cz * sy * cx + sz * sx
+    R[:, 1, 0] = sz * cy
+    R[:, 1, 1] = sz * sy * sx + cz * cx
+    R[:, 1, 2] = sz * sy * cx - cz * sx
+    R[:, 2, 0] = -sy
+    R[:, 2, 1] = cy * sx
+    R[:, 2, 2] = cy * cx
+    local = np.zeros((n, 4, 4))
+    local[:, :3, :3] = R * scale[:, None, None]
+    local[:, :3, 3] = co
+    local[:, 3, 3] = 1.0
+    mw = np.array(inst.matrix_world, dtype=np.float64)
+    world = mw[None] @ local
+    s = scale.astype(np.float64) * max(abs(v) for v in inst.matrix_world.to_scale())
+    return np.ascontiguousarray(world[:, :3, :], dtype=np.float32), s.astype(np.float32)
+
+
+def native_lights(scene, reach=0.0):
+    """Shadow-casting lamps of the scene as native.ShadowLight structs (for vgeo_select_instances)."""
+    suns, local = shadow_lights(scene)
+    out = []
+    for d in suns:
+        L = native.ShadowLight()
+        L.kind = 0
+        L.dir[:] = [float(v) for v in d]
+        L.reach = float(reach or 0.0)
+        out.append(L)
+    for pos, rng, axis, half in local:
+        L = native.ShadowLight()
+        L.kind = 1
+        L.pos[:] = [float(v) for v in pos]
+        L.range = float(rng)
+        if axis is not None:
+            L.axis[:] = [float(v) for v in axis]
+        L.half_angle = float(half)
+        out.append(L)
+    return out
+
+
+def world_views(views, pixel_error):
+    """The live loop's views as world-space native views (vgeo_select_instances)."""
+    out = []
+    for view, window, height, persp, clip_start in views:
+        planes = stream._frustum_planes(window @ view)
+        if persp:
+            out.append(native.make_view(view.inverted().translation, window[1][1], max(clip_start, 1e-6),
+                                        pixel_error / max(1, height), planes=planes, mode="FULL"))
+        else:
+            h = 2.0 / window[1][1] if window[1][1] else 1.0
+            out.append(native.make_view(view.inverted().translation, window[1][1], max(clip_start, 1e-6),
+                                        pixel_error / max(1, height), ortho=True, ortho_height=h,
+                                        planes=planes, mode="FULL"))
+    return out
+
+
+def select_atoms(inst, asset, views, pixel_error, mode=None, offscreen_scale=None, transforms=None):
+    """A meshlet cut on every copy in one native call: ((m, 2) uint32 (copy, atom) pairs, stats)."""
+    vi = inst.vgeo_inst
+    mode = mode or getattr(vi, "offscreen", "COARSEN")
+    offscreen_scale = offscreen_scale or getattr(vi, "offscreen_scale", 8.0)
+    tr, sc = transforms if transforms is not None else copy_transforms(inst)
+    lights = native_lights(_scene_of(inst), getattr(vi, "shadow_distance", 0.0)) if mode == "SHADOWS" else []
+    return asset.select_instances(world_views(views, pixel_error), tr, sc, mode=mode,
+                                  offscreen_scale=offscreen_scale, lights=lights)
+
+
 def _clear_fronts(ob):
     if ob.vgeo.collection is None:   # never streamed: no chunk objects to empty (none are created)
         return
