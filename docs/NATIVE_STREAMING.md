@@ -280,6 +280,7 @@ RTX A4500, Blender 5.1.2 (private memory; frame 1 excluded):
 | EEVEE, animation render | 2,226 MB | 2,691 MB | 2,737 MB | +1.7 % (1.5 MB/frame) |
 | Cycles (OptiX), one still per frame | 4,536 MB | 5,235 MB | 4,836 MB | -7.6 % |
 | Cycles, frozen after frame 1 | 4,212 MB | 4,207 MB | 4,207 MB | 0.0 % |
+| Cycles, animation render | 4,377 MB | 5,232 MB | 5,041 MB | -3.7 % |
 
 Memory grows while the camera path first visits the scene (EEVEE's GPU
 caches; the native heap goes from 31 to 61 MB as streamed copies size their
