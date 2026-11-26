@@ -107,9 +107,12 @@ change every frame.
       Memory warms up over the first ~50 frames, then stays flat (second half
       -7.6 % to +1.7 %); frozen runs separate the add-on from the engine. The
       film's per-frame growth was EEVEE's software-GL path. T3 holds on a GPU.
-- [ ] Viewport check of the new modes on a GPU (`tests/viewport_bench.py`),
-      Solid and EEVEE, flying through the statue avenue. Record fps and worst
-      frame before and after.
+- [x] Viewport check on a GPU (`tests/viewport_bench.py --cameras
+      examples/statue_avenue/cameras.json --seconds 24`, 2100x1341, 1 px, RTX
+      A4500), flying the film path: before PR #2 Solid 35.5 / EEVEE 15.9 fps
+      (worst 120 ms); with PR #2 (Shadows, 8 streamed copies) 17.5 / 13.0 fps
+      (worst 264 ms). More streamed copies cost the viewport more than their
+      saved triangles gain; phase 2 (53.6 / 23.6 fps) replaces them.
 - [x] New instancers (Scatter, `create_instancer`) use Shadows; the property
       default stays Coarsen, so existing files render what they did.
 - [x] Shadows mode (was Sun Shadows): lamps scanned once per tick; copies
@@ -173,10 +176,11 @@ Measured on the statue avenue and the synthetic field (RTX A4500, Blender 5.1.2)
   of 512 atoms is one mesh (atom index as a face attribute) on a library object
   whose Split to Instances runs once; each slice has a point cloud that reads it
   with Object Info + Pick Instance. A full avenue cut change: ~10 ms depsgraph.
-- Mitigation 2, an instance cost: EEVEE pays ~2 us per instance per frame. In
-  the viewport each copy is drawn as its atoms or as one whole level mesh,
-  whichever costs less counting ~300 triangles per instance (synthetic field,
-  EEVEE flying: 17.7 fps atoms only, 29.5 fps with the fallback).
+- Mitigation 2, an instance budget: EEVEE pays ~2 us per instance per frame.
+  In the viewport an instancer draws at most 8,000 instances: copies start as
+  one whole level mesh and switch to their atoms in order of triangles saved
+  per extra instance (synthetic field, EEVEE flying: 17.7 fps atoms only, 43.5
+  fps with the budget).
 - Parent-merged blocks would cut instances by another 33-40 % at no triangle
   cost (not built yet).
 
@@ -187,7 +191,7 @@ default; branch `phase2-atoms`):
       copies, Off-screen modes per atom, multithreaded): 2-7 ms per instancer.
 - [x] Sliced object-free atom libraries, one point cloud per slice, spare points.
 - [x] Live loop: paced updates (at most every 0.2 s while the view moves, at
-      once when it stops); per-copy level fallback in the viewport.
+      once when it stops); per-copy level fallback under an instance budget.
 - [x] Tests: atom cut = per-cluster cut, watertight instanced cut, culled atoms
       leave the instancing, final render cut, save/load, switching back.
 - [ ] Parent-merged blocks (fewer instances).
@@ -212,9 +216,12 @@ T2, GUI viewport flying the film path (`tests/viewport_bench.py --cameras ...
 | Statue avenue, today | 17.5 fps | 13.0 fps (264 ms) | 24.6 fps |
 | Statue avenue, atoms | 53.6 fps | 23.6 fps (96 ms) | 42.7 fps |
 | Synthetic field, today | 33.9 fps | 21.6 fps (131 ms) | 52.2 fps |
-| Synthetic field, atoms | 77.8 fps | 29.5 fps (85 ms) | 26.7 fps* |
+| Synthetic field, atoms, 8k instance budget | 92.2 fps | 43.5 fps (44 ms) | 53.7 fps |
 
-*Run-to-run spread of EEVEE numbers on this remote machine is about 20 %.
+Run-to-run spread of EEVEE numbers on this remote machine is about 20 %. The
+synthetic field first ran with a fixed 300-triangle cost per instance (29.5
+fps flying, 26.7 still: 20k+ instances); the budget keeps EEVEE still frames at
+today's speed.
 
 Final renders (EEVEE, 1280x720, 1.5 px): Shadows mode is pixel-identical to
 Coarsen with atoms, as without; atoms against today's path differ by 0.13-0.2
