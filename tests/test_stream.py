@@ -663,6 +663,113 @@ def run():
     bpy.data.objects.remove(sun)
     for name, hidden in lights.items():
         scene.objects[name].hide_render = hidden
+
+    # ---- meshlet instancing: every copy cut into atoms (clusters sharing a (group, refined) pair)
+    if native.has_atoms():
+        asset = native.Asset(stream.asset_path(proxy))
+        atoms = asset.atoms()
+        check("atoms partition the clusters", int(atoms["cluster_count"].sum()) == asset.info["cluster_count"]
+              and len(np.unique(atoms["group"].astype(np.int64) * (1 << 32) + atoms["refined"] + 1)) == len(atoms),
+              f"{len(atoms)} atoms")
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(scene)]
+        v, window, height, persp, clip_start = views[0]
+        tr, sc = instances.copy_transforms(inst)
+        # the per-cluster cut of each copy (local view) against one call for all copies
+        same = {}
+        for mode in ("FULL", "COARSEN", "CULL"):
+            pairs, st = instances.select_atoms(inst, asset, views, 1.0, mode=mode, transforms=(tr, sc))
+            got = np.bincount(pairs[:, 0], weights=atoms["tri_count"][pairs[:, 1]], minlength=len(sc))
+            per = np.zeros(len(sc), np.int64)
+            for i in range(len(sc)):
+                m = inst.matrix_world @ instances.placement_matrix(inst, i)
+                s = max(abs(x) for x in m.to_scale())
+                lv = native.make_view(m.inverted() @ v.inverted().translation, window[1][1],
+                                      max(clip_start / s, 1e-6), 1.0 / height,
+                                      planes=stream._frustum_planes(window @ v @ m), mode=mode, offscreen_scale=8.0)
+                asset.select([lv])
+                per[i] = int(asset.last.triangles)
+            if mode == "CULL":   # copies outside skipped by the asset's tighter bounds; the rest match
+                same[mode] = bool(np.all((got == per) | (got == 0)))
+            else:
+                same[mode] = bool(np.array_equal(got.astype(np.int64), per))
+            same[mode + "_tris"] = int(got.sum())
+        check("atom cut equals the per-cluster cut on every copy", same["FULL"] and same["COARSEN"] and same["CULL"],
+              str(same))
+        check("culled atoms draw fewer triangles", same["CULL_tris"] < same["COARSEN_tris"] < same["FULL_tris"])
+        # an instanced cut is crack-free: a copy seen from close up mixes levels, its atoms weld shut
+        near = int(np.argmin(np.linalg.norm(tr[:, :, 3] - np.array([0.0, 10.0, -1.0]), axis=1)))
+        p = tr[near, :, 3]
+        camera(tuple(p + np.array([0.0, -1.6, 0.5]) * float(inst["vgeo_radius"]) * float(sc[near])),
+               target=tuple(p), lens=24)
+        views = [stream.camera_view(scene)]
+        pairs, st = instances.select_atoms(inst, asset, views, 1.0, mode="COARSEN", transforms=(tr, sc))
+        mine = pairs[pairs[:, 0] == near, 1]
+        pos_all, tri_all, base = [], [], 0
+        for k in mine:
+            d = asset.extract_atom(int(k))
+            pos_all.append(d["positions"].reshape(-1, 3))
+            tri_all.append(d["corner_verts"].reshape(-1, 3) + base)
+            base += d["vertex_count"]
+        depths = set(atoms["depth"][mine].tolist())
+        oe = open_edges(np.concatenate(pos_all), np.concatenate(tri_all))
+        check("instanced atom cut is watertight", oe == 0 and len(depths) >= 2,
+              f"{oe} open edges, {len(mine)} atoms, depths {sorted(depths)}")
+        asset.close()
+
+        # the instancer switched to meshlet instancing: atom meshes, a point per pair, real instances
+        inst.vgeo_inst.offscreen = 'COARSEN'
+        inst.vgeo_inst.use_atoms = True
+        check("meshlet instancing builds one mesh per atom, no streamed copies",
+              inst.vgeo_inst.atoms is not None and len(inst.vgeo_inst.atoms.objects) == len(atoms)
+              and inst.vgeo_inst.atom_points is not None
+              and all(o.vgeo.slot_index < 0 for o in instances.slots(inst)))
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(scene)]
+
+        def drawn():
+            dg = bpy.context.evaluated_depsgraph_get()
+            n, tris = 0, 0
+            for i in dg.object_instances:
+                if i.is_instance and i.parent and i.parent.original in (inst, inst.vgeo_inst.atom_points):
+                    n += 1
+                    tris += len(i.object.data.polygons)
+            return n, tris
+
+        instances.update(inst, views, 1.0)
+        n_c, t_c = drawn()
+        npts = len(inst.vgeo_inst.atom_points.data.vertices)
+        check("one instance per (copy, atom) pair, nothing from levels",
+              n_c == npts > 0 and t_c == inst.vgeo_inst.shown_triangles, f"{n_c} instances, {npts} points, "
+              f"{t_c:,} vs {inst.vgeo_inst.shown_triangles:,} tris")
+        check("meshlet instancing draws the per-cluster cut", t_c == same["COARSEN_tris"],
+              f"{t_c:,} vs {same['COARSEN_tris']:,}")
+        inst.vgeo_inst.offscreen = 'CULL'
+        instances.update(inst, views, 1.0)
+        n_x, t_x = drawn()
+        check("culled atoms leave the instancing", n_x < n_c and t_x < t_c, f"{n_x} < {n_c}")
+        # final renders cut at the render error
+        inst.vgeo_inst.render_pixel_error = 0.5
+        stream.update_for_render(scene)
+        n_r, t_r = drawn()
+        check("final render cuts at the render error", t_r > t_x, f"{t_r:,} vs {t_x:,}")
+        inst.vgeo_inst.offscreen = 'COARSEN'
+        bpy.ops.wm.save_mainfile()
+        bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
+        inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
+        scene = bpy.context.scene
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(bpy.context.scene)]
+        instances.update(inst, views, 1.0)
+        n_l, t_l = drawn()
+        check("meshlet instancing survives save/load", inst.vgeo_inst.use_atoms and n_l == n_c and t_l == t_c,
+              f"{n_l} vs {n_c}")
+        inst.vgeo_inst.use_atoms = False
+        instances.update(inst, views, 1.0)
+        n_o, _ = drawn()
+        check("switching back shows whole-copy levels", n_o == len(inst.data.vertices), str(n_o))
+        proxy = next(o for o in bpy.data.objects if o.vgeo.uid)
+
     inst.vgeo_inst.offscreen = 'COARSEN'
     inst.vgeo_inst.stream_slots = 2
     bpy.ops.wm.save_mainfile()

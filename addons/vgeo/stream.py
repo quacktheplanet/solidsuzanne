@@ -958,6 +958,8 @@ def _on_render_done(scene, depsgraph=None):
 @persistent
 def _on_load(_a=None, _b=None):
     invalidate_all(close=True)
+    from . import instances
+    instances.close_atom_assets()
 
 
 @persistent

@@ -66,6 +66,13 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
     source: PointerProperty(type=bpy.types.Object, name="Asset",
                             description="The virtualized object these placements show")
     levels: PointerProperty(type=bpy.types.Collection, name="Levels")
+    use_atoms: BoolProperty(
+        name="Meshlet Instancing", default=False,
+        description="Experimental: draw every copy as its own meshlet cut, made of instanced pieces of the "
+                    "asset (cut atoms) that never change, instead of whole-asset levels and streamed copies",
+        update=lambda self, ctx: instances.set_use_atoms(self.id_data, self.use_atoms))
+    atoms: PointerProperty(type=bpy.types.Collection, name="Atoms")
+    atom_points: PointerProperty(type=bpy.types.Object, name="Atom Points")
     pixel_error: FloatProperty(name="Viewport Error", default=1.0, min=0.1, soft_max=8.0, subtype='PIXEL')
     render_pixel_error: FloatProperty(name="Render Error", default=0.5, min=0.05, soft_max=4.0, subtype='PIXEL')
     min_level: IntProperty(name="Finest Level", default=0, min=0, soft_max=8,
@@ -359,7 +366,10 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.prop(vi, "pixel_error")
             layout.prop(vi, "render_pixel_error")
             layout.prop(vi, "min_level")
-            layout.prop(vi, "stream_slots")
+            if native.has_atoms():
+                layout.prop(vi, "use_atoms")
+            if not vi.use_atoms:
+                layout.prop(vi, "stream_slots")
             layout.prop(vi, "offscreen")
             if vi.offscreen != 'CULL':
                 layout.prop(vi, "offscreen_scale")

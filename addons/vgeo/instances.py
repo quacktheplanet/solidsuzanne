@@ -413,6 +413,8 @@ def update(inst, views, pixel_error, mode=None, offscreen_scale=None, render=Fal
     default to the instancer's Off-screen settings."""
     mode = mode or getattr(inst.vgeo_inst, "offscreen", "COARSEN")
     offscreen_scale = offscreen_scale or getattr(inst.vgeo_inst, "offscreen_scale", 8.0)
+    if getattr(inst.vgeo_inst, "use_atoms", False) and inst.vgeo_inst.atoms is not None and native.has_atoms():
+        return update_atoms(inst, views, pixel_error, mode, offscreen_scale)
     levels, budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
     changed = apply_levels(inst, levels)
     wanted = _wanted_slots(inst, levels, budget)
@@ -827,3 +829,187 @@ def create_instancer(context, source, surface, count, seed=0, scale_range=(0.7, 
     inst.vgeo_inst.offscreen = 'SHADOWS'
     build_levels(inst, source)
     return inst
+
+
+# ---------------------------------------------------------------- meshlet instancing (cut atoms)
+#
+# Every copy shows its own meshlet cut, made of instanced atoms: an atom is the set of clusters sharing
+# a (group, refined) pair, so it is always in or out of the cut as a whole. Each atom is built once as
+# a small mesh; every update the native runtime selects (copy, atom) pairs for all copies in one call,
+# and a point mesh parented to the instancer gets one point per pair (the copy's placement, the atom's
+# index). Geometry Nodes instances the atom meshes on those points: navigating only rewrites points.
+
+ATOM_ATTR = "vgeo_atom"
+ATOMS_NODE_GROUP = "VGEO Atoms"
+
+_atom_assets = {}   # instancer uid -> native.Asset (own handle, memory-mapped)
+_atom_state = {}    # instancer uid -> last pairs written (to skip unchanged updates)
+
+
+def ensure_atoms_node_group():
+    ng = bpy.data.node_groups.get(ATOMS_NODE_GROUP)
+    if ng and ng.bl_idname == "GeometryNodeTree" and "Atoms" in ng.interface.items_tree:
+        return ng
+    ng = bpy.data.node_groups.new(ATOMS_NODE_GROUP, "GeometryNodeTree")
+    ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    ng.interface.new_socket("Atoms", in_out="INPUT", socket_type="NodeSocketCollection")
+    ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    n, L = ng.nodes, ng.links
+    gin = n.new("NodeGroupInput")
+    info = n.new("GeometryNodeCollectionInfo")
+    info.transform_space = "ORIGINAL"
+    info.inputs["Separate Children"].default_value = True
+    info.inputs["Reset Children"].default_value = True
+    L.new(gin.outputs["Atoms"], info.inputs["Collection"])
+
+    def named(name, kind):
+        a = n.new("GeometryNodeInputNamedAttribute")
+        a.data_type = kind
+        a.inputs["Name"].default_value = name
+        return a
+
+    idx = named(ATOM_ATTR, 'INT')
+    rot = named(ROT_ATTR, 'FLOAT_VECTOR')
+    scl = named(SCALE_ATTR, 'FLOAT')
+    e2r = n.new("FunctionNodeEulerToRotation")
+    L.new(rot.outputs["Attribute"], e2r.inputs[0])
+    iop = n.new("GeometryNodeInstanceOnPoints")
+    L.new(gin.outputs["Geometry"], iop.inputs["Points"])
+    L.new(info.outputs["Instances"], iop.inputs["Instance"])
+    iop.inputs["Pick Instance"].default_value = True
+    L.new(idx.outputs["Attribute"], iop.inputs["Instance Index"])
+    L.new(e2r.outputs[0], iop.inputs["Rotation"])
+    L.new(scl.outputs["Attribute"], iop.inputs["Scale"])
+    out = n.new("NodeGroupOutput")
+    L.new(iop.outputs["Instances"], out.inputs["Geometry"])
+    return ng
+
+
+def _atom_asset(inst):
+    uid = inst.vgeo_inst.uid
+    a = _atom_assets.get(uid)
+    if a is None:
+        a = native.Asset(stream.asset_path(inst.vgeo_inst.source))
+        _atom_assets[uid] = a
+    return a
+
+
+def close_atom_assets():
+    for a in _atom_assets.values():
+        a.close()
+    _atom_assets.clear()
+    _atom_state.clear()
+
+
+def build_atoms(inst):
+    """Build one mesh per cut atom of the instancer's asset, in a collection only Geometry Nodes reads
+    (named by index: Collection Info sorts children by name)."""
+    vi = inst.vgeo_inst
+    uid = vi.uid
+    asset = _atom_asset(inst)
+    atoms = asset.atoms()
+    col = vi.atoms
+    if col is None:
+        col = bpy.data.collections.new(f".vgeo atoms {uid}")
+        vi.atoms = col
+    for ob in list(col.objects):   # previous build
+        me = ob.data
+        bpy.data.objects.remove(ob)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+    materials = tuple(vi.source.data.materials)
+    for k in range(len(atoms)):
+        name = f"vgeo.{uid}.A{k:05d}"
+        me = bpy.data.meshes.new(name)
+        stream._sync_materials(me, materials)
+        stream.fill_mesh(me, asset.extract_atom(k), materials, False)
+        ob = bpy.data.objects.new(name, me)
+        col.objects.link(ob)
+    inst["vgeo_atom_tris"] = [int(t) for t in atoms["tri_count"]]
+    _atom_state.pop(uid, None)
+    return len(atoms)
+
+
+def _ensure_atom_points(inst):
+    vi = inst.vgeo_inst
+    ob = vi.atom_points
+    if ob is None or ob.name not in bpy.data.objects:
+        me = bpy.data.meshes.new(f"{inst.name} Atom Points")
+        ob = bpy.data.objects.new(f"{inst.name} Atom Points", me)
+        ob.parent = inst
+        ob.hide_select = True
+        vi.atom_points = ob
+    for col in inst.users_collection:
+        if ob.name not in col.objects:
+            col.objects.link(ob)
+    ng = ensure_atoms_node_group()
+    mod = next((m for m in ob.modifiers if m.type == 'NODES' and m.node_group == ng), None)
+    if mod is None:
+        mod = ob.modifiers.new("VGEO Atoms", 'NODES')
+        mod.node_group = ng
+    if mod[_socket_id(ng, "Atoms")] != vi.atoms:
+        mod[_socket_id(ng, "Atoms")] = vi.atoms
+    ob.hide_viewport = ob.hide_render = False
+    return ob
+
+
+def set_use_atoms(inst, on):
+    """Switch an instancer between whole-asset levels (with streamed copies) and meshlet instancing."""
+    vi = inst.vgeo_inst
+    if on:
+        if not native.has_atoms():
+            print("VGEO: this build of the native library has no cut atoms")
+            return
+        if vi.atoms is None or not len(vi.atoms.objects):
+            build_atoms(inst)
+        _ensure_atom_points(inst)
+        flags = _streamed_flags(inst)   # streamed copies are not needed: every copy is cut
+        for ob in slots(inst):
+            if ob.vgeo.slot_index >= 0:
+                _release_slot(inst, ob, flags)
+        _write_streamed(inst, flags)
+    else:
+        pts = vi.atom_points
+        if pts is not None:
+            pts.hide_viewport = pts.hide_render = True
+        _atom_state.pop(vi.uid, None)
+
+
+def _write_atom_points(inst, pairs):
+    """One point per (copy, atom) pair, with the copy's placement (in the instancer's space)."""
+    vi = inst.vgeo_inst
+    ob = _ensure_atom_points(inst)
+    prev = _atom_state.get(vi.uid)
+    if prev is not None and prev.shape == pairs.shape and np.array_equal(prev, pairs):
+        return False
+    me = inst.data
+    co, scale = _points(inst)
+    rot = np.zeros((len(co), 3), np.float32)
+    a = me.attributes.get(ROT_ATTR)
+    if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
+        a.data.foreach_get("vector", rot.ravel())
+    copy, atom = pairs[:, 0].astype(np.int64), pairs[:, 1].astype(np.int32)
+    pm = ob.data
+    pm.clear_geometry()
+    m = len(pairs)
+    pm.vertices.add(m)
+    pm.vertices.foreach_set("co", np.ascontiguousarray(co[copy]).ravel())
+    pm.attributes.new(ATOM_ATTR, 'INT', 'POINT').data.foreach_set("value", atom)
+    pm.attributes.new(ROT_ATTR, 'FLOAT_VECTOR', 'POINT').data.foreach_set(
+        "vector", np.ascontiguousarray(rot[copy]).ravel())
+    pm.attributes.new(SCALE_ATTR, 'FLOAT', 'POINT').data.foreach_set(
+        "value", np.ascontiguousarray(scale[copy]))
+    pm.update()
+    _atom_state[vi.uid] = pairs.copy()
+    return True
+
+
+def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None):
+    """Meshlet instancing update: one native selection for every copy, then rewrite the points."""
+    asset = _atom_asset(inst)
+    pairs, st = select_atoms(inst, asset, views, pixel_error, mode, offscreen_scale)
+    changed = _write_atom_points(inst, pairs)
+    levels = np.full(len(inst.data.vertices), -1, np.int32)   # the level path shows nothing
+    changed |= apply_levels(inst, levels)
+    inst.vgeo_inst.shown_triangles = int(min(st.triangles, 2**31 - 1))
+    return changed
