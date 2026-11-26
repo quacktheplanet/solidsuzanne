@@ -5,23 +5,63 @@
 <h1 align="center">VGEO — Virtualized Geometry for Blender</h1>
 
 <p align="center">
-  Nanite-style meshlet rendering in the Blender viewport, built on Vulkan.
+  Nanite-style cluster LOD for Blender's own renderers: billions of triangles in the viewport, EEVEE and Cycles.
 </p>
 
 ---
 
-## New: native streaming (EEVEE + Cycles)
+VGEO turns dense meshes into a Nanite-style cluster hierarchy (built with
+meshoptimizer's clusterlod into a memory-mapped `.vgeo` file) and hands Blender
+only the crack-free, view-dependent cut each view needs, as ordinary meshes and
+instances. EEVEE and Cycles render it with full materials, lights and shadows.
+Nothing else does this for Blender's own renderers: other virtual geometry lives
+inside its own engine.
 
-`addons/vgeo` + `src/stream` virtualize the geometry instead of replacing
-Blender's renderer: a Nanite-style cluster DAG (built with meshoptimizer's
-clusterlod) stays on disk, and only the view-dependent, crack-free cut is
-streamed into ordinary meshes, so EEVEE and Cycles render it with full
-materials, lights and shadows. A 33.5M-triangle terrain streams at ~28 fps
-while moving and renders in Cycles from a cut of a few million triangles.
-See [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
+- **Virtualize Mesh**: one object streams its cut into mesh chunks (a 33.5M
+  triangle terrain streams at ~28 fps while moving).
+- **Scatter Instances / Virtualize Instances**: thousands of copies of an asset,
+  scattered by VGEO or taken over from your own Geometry Nodes, particle or
+  collection-instance scatter. Each copy gets its own level of detail.
+- **Meshlet Instancing** (experimental): every copy drawn as its own meshlet cut,
+  built from instanced pieces of the asset that never change. On the 4.36-billion
+  triangle statue avenue it draws within 6 % of a per-copy meshlet cut (the rule
+  the browser viewers use) and flies at 50 fps in EEVEE, 86 fps in Solid (1280x800
+  window, RTX A4500), against 13 and 16 fps for whole-copy levels.
+- **Off-screen modes**: copies outside the view coarsened, culled, or kept only
+  while their shadow can reach it.
+- **Debug views**: Meshlets, LOD and Triangles, plus a stats overlay.
+- **Web export**: the same assets in a WebGPU viewer (`web/`), paged over HTTP
+  range requests.
+
+How it works and every measurement: [docs/NATIVE_STREAMING.md](docs/NATIVE_STREAMING.md).
 Where it is going: [docs/ROADMAP.md](docs/ROADMAP.md).
 
-The sections below describe the original Vulkan proof of concept.
+## Quick start
+
+```
+cmake -S . -B build-stream -G Ninja -DCMAKE_BUILD_TYPE=Release -DVGEO_STREAM_ONLY=ON
+cmake --build build-stream
+```
+
+Needs a C++20 compiler (no Vulkan SDK, no Python headers); the library lands in
+`addons/vgeo/bin/`. Install `addons/vgeo` as an add-on (or zip it with
+`tools/package_addon.py`), save your .blend, select a mesh and run
+**Object > Virtualize Mesh**. The VGEO sidebar tab has everything else.
+
+Tests and benchmarks (Blender 5.1):
+
+```
+blender -b --factory-startup --python tests/test_stream.py
+blender -b --factory-startup --python examples/statue_avenue/build_scene.py -- OUT
+blender -b OUT/statue_avenue.blend --python tools/instancing_bench.py -- --cameras examples/statue_avenue/cameras.json --error 1.5 --offscreen SHADOWS,CULL
+```
+
+---
+
+## The original Vulkan proof of concept
+
+The sections below describe where the project started: a headless Vulkan
+meshlet renderer whose pixels are copied into the viewport (`addons/vgeo_blender`).
 
 ---
 
