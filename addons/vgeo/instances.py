@@ -241,9 +241,10 @@ class tick_scope:
         return self
 
     def __exit__(self, *exc):
-        global _lights_cache
+        global _lights_cache, _occlusion_current
         if not self.outer:
             _lights_cache = None
+            _occlusion_current = None   # built for this tick's view only
         return False
 
 
@@ -1085,6 +1086,22 @@ def _concat(parts):
     return res
 
 
+def _placeholder(asset):
+    """One zero-area triangle at the origin, in the layout extract returns."""
+    return {"positions": np.zeros(9, np.float32), "normals": np.tile(np.float32([0, 0, 1]), 3),
+            "uvs": np.zeros(6, np.float32) if asset.has_uvs else None,
+            "corner_verts": np.array([0, 1, 2], np.int32), "face_materials": np.zeros(1, np.int32),
+            "face_lod": np.zeros(1, np.int32), "edge_verts": np.array([0, 1, 1, 2, 2, 0], np.int32),
+            "corner_edges": np.array([0, 1, 2], np.int32), "vertex_count": 3, "tri_count": 1, "edge_count": 3}
+
+
+def reset_atom_state():
+    """Forget what the clouds are believed to hold (after undo/redo restored older contents)."""
+    _atom_state.clear()
+    _atom_pace.clear()
+    _atom_clouds.clear()
+
+
 def _remove_objects(obs):
     for ob in list(obs):
         me = ob.data
@@ -1119,8 +1136,8 @@ def build_atoms(inst):
         parts, local = [], []
         for a in range(lo, hi):
             d = asset.extract_atom(a)
-            if d is None:   # every cluster corrupt (reported by the asset): later indices would shift
-                continue
+            if d is None:   # every cluster corrupt (reported by the asset): keep its index with a
+                d = _placeholder(asset)   # degenerate triangle, or later pieces would shift
             parts.append(d)
             local.append(np.full(d["tri_count"], a - lo, np.int32))
         name = f"vgeo.{uid}.atoms{k:03d}"
@@ -1270,23 +1287,23 @@ def _write_atom_points(inst, pairs):
     order = np.argsort(sl, kind="stable")
     sp = pairs[order]
     bounds = np.searchsorted(sl[order], np.arange(max(clouds) + 2))
-    data = None
+    # the clouds carry the copies' placements too: a cloud is current only for the same pairs and
+    # the same placements
+    co, scale = _points(inst)
+    rot = np.zeros((len(co), 3), np.float32)
+    a = inst.data.attributes.get(ROT_ATTR)
+    if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
+        a.data.foreach_get("vector", rot.ravel())
+    sig = hash((co.tobytes(), rot.tobytes(), scale.tobytes()))
     written = 0
     for k, ob in clouds.items():
         part = sp[bounds[k]:bounds[k + 1]]
         key = (vi.uid, k)
         prev = _atom_state.get(key)
-        if prev is not None and prev.shape == part.shape and np.array_equal(prev, part):
+        if prev is not None and prev[0] == sig and prev[1].shape == part.shape and np.array_equal(prev[1], part):
             continue
-        if data is None:
-            co, scale = _points(inst)
-            rot = np.zeros((len(co), 3), np.float32)
-            a = inst.data.attributes.get(ROT_ATTR)
-            if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
-                a.data.foreach_get("vector", rot.ravel())
-            data = (co, rot, scale)
-        _write_cloud(ob, part[:, 0].astype(np.int64), (part[:, 1] % ATOM_SLICE).astype(np.int32), *data)
-        _atom_state[key] = part.copy()
+        _write_cloud(ob, part[:, 0].astype(np.int64), (part[:, 1] % ATOM_SLICE).astype(np.int32), co, rot, scale)
+        _atom_state[key] = (sig, part.copy())
         written += 1
     return written
 
@@ -1298,13 +1315,17 @@ def _views_key(inst, views, pixel_error, mode, offscreen_scale):
     rot = np.zeros(len(co) * 3, np.float32)
     if a is not None and a.domain == 'POINT' and a.data_type == 'FLOAT_VECTOR':
         a.data.foreach_get("vector", rot)
-    parts = [round(pixel_error, 4), mode, round(offscreen_scale or 0, 3),
+    vi = inst.vgeo_inst
+    parts = [round(pixel_error, 4), mode, round(offscreen_scale or 0, 3), int(vi.min_level),
+             round(float(getattr(vi, "shadow_distance", 0.0)), 4), bool(getattr(vi, "use_occlusion", False)),
              hash(co.tobytes()), hash(scale.tobytes()), hash(rot.tobytes()),
              tuple(round(x, 6) for row in inst.matrix_world for x in row)]
     if mode == "SHADOWS":
         suns, local = shadow_lights(_scene_of(inst))
         parts.append(tuple(tuple(np.round(d, 5)) for d in suns))
-        parts.append(tuple((tuple(np.round(p, 4)), round(r, 4)) for p, r, _a, _h in local))
+        parts.append(tuple((tuple(np.round(p, 4)), round(r, 4),
+                            None if ax is None else tuple(np.round(ax, 5)), round(h, 5))
+                           for p, r, ax, h in local))
     for view, window, height, persp, clip_start in views:
         parts.append(tuple(round(x, 5) for row in view for x in row))
         parts.append(tuple(round(x, 5) for row in window for x in row))
@@ -1323,8 +1344,10 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
         key = _views_key(inst, views, pixel_error, mode, offscreen_scale)
         pace = _atom_pace.get(uid)
         now = time.perf_counter()
+        # with occlusion the cut also depends on the other instancers (occluders): no shortcut
+        occluded = bool(getattr(inst.vgeo_inst, "use_occlusion", False))
         if pace is not None:
-            if key == pace[1]:
+            if key == pace[1] and not occluded:
                 pace[2] = key
                 return False   # this view's cut is already shown
             moving = key != pace[2]
@@ -1343,7 +1366,7 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
         # viewport over budget: some copies are drawn as one whole level mesh instead of their atoms
         # (final renders always draw atoms: fewer triangles, and renderers cope with the instances)
         atom_tris = np.asarray(inst.get("vgeo_atom_tris", []), np.int64)
-        if len(atom_tris):
+        if len(atom_tris) and int(pairs[:, 1].max()) < len(atom_tris):
             lv, _budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
             _errors, lvl_tris = _level_tables(inst)
             c = pairs[:, 0].astype(np.int64)

@@ -819,7 +819,9 @@ def update_for_render(scene, depsgraph=None):
             if inst.vgeo_inst.atoms is not None:
                 instances.sync_cloud_visibility(inst)
         insts = [i for i in instances.instancers(scene) if not i.hide_render]
-        instances.prepare_occlusion(insts, [view])
+        vl_objects = bpy.context.view_layer.objects if bpy.context.view_layer else None
+        occluders = [i for i in insts if vl_objects is None or i.name in vl_objects]
+        instances.prepare_occlusion(occluders, [view])
         for inst in insts:
             instances.update(inst, [view], inst.vgeo_inst.render_pixel_error, render=True)
     for obj in proxies(scene):
@@ -987,6 +989,8 @@ def _on_save(_a=None, _b=None):
 @persistent
 def _on_undo(_a=None, _b=None):
     invalidate_all()
+    from . import instances
+    instances.reset_atom_state()
 
 
 def new_uid():
@@ -1016,3 +1020,5 @@ def unregister():
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     invalidate_all(close=True)
+    from . import instances
+    instances.close_atom_assets()

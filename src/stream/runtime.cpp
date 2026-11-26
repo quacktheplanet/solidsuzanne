@@ -772,9 +772,9 @@ extern "C" VGEO_API int vgeo_occlusion_add(void* occ, void* handle, const float*
         int L = 0;
         for (int k = int(errs.size()) - 1; k >= 0; --k)
             if (errs[k] * s / dist * proj_h / std::max(wlen, 1e-20f) * O->h * 0.5f <= pixel_error) { L = k; break; }
-        // never more than kOccluderCopyTris per copy: a coarser level, pushed back by its larger
-        // error, is still a valid (if weaker) occluder
-        while (L + 1 < int(a->level_tri_counts.size()) && a->level_tri_counts[L] > O->copy_tris) ++L;
+        // too heavy at the level its error allows: not an occluder (a coarser level could bulge
+        // sideways past the real silhouette, which pushing it back does not undo)
+        if (L < int(a->level_tri_counts.size()) && a->level_tri_counts[L] > O->copy_tris) continue;
         const LevelTris& T = level_tris(*a, L, a->level_cache);
         const float push = O->push ? T.error * s : 0.f;   // move each vertex away from the camera by the level's error
         const size_t n = T.pos.size() / 9;

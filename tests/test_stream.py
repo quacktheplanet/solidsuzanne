@@ -801,6 +801,23 @@ def run():
         n_l, t_l = drawn()
         check("meshlet instancing survives save/load", inst.vgeo_inst.use_atoms and n_l == n_c and t_l == t_c,
               f"{n_l} vs {n_c}")
+        # moving a placement moves its atoms even when the pairs stay the same
+        instances.update(inst, [stream.camera_view(bpy.context.scene)], 1.0)
+        cl0 = next(o for o in instances.atom_clouds(inst).values()
+                   if (np.array([v.value for v in o.data.attributes[instances.ATOM_ATTR].data]) >= 0).any())
+        idx = np.array([v.value for v in cl0.data.attributes[instances.ATOM_ATTR].data])
+        pts = np.array([tuple(v.co) for v in cl0.data.vertices])[idx >= 0]
+        all_co = np.array([tuple(v.co) for v in inst.data.vertices])
+        c = int(np.argmin(np.linalg.norm(all_co - pts[0], axis=1)))
+        inst.data.vertices[c].co.z += 0.01
+        inst.data.update()
+        instances.update(inst, [stream.camera_view(bpy.context.scene)], 1.0)
+        pts2 = np.array([tuple(v.co) for v in cl0.data.vertices])
+        check("a moved placement moves its atoms", np.isclose(pts2[:, 2], all_co[c, 2] + 0.01, atol=1e-5).any())
+        inst.data.vertices[c].co.z -= 0.01
+        inst.data.update()
+        stream._on_undo()
+        check("undo forgets what the clouds held", not instances._atom_state and not instances._atom_pace)
         # two views: the cut satisfies both (no fewer triangles than either alone)
         camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
         v1 = stream.camera_view(bpy.context.scene)

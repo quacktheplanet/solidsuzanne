@@ -336,6 +336,7 @@ class VGEO_OT_refresh(bpy.types.Operator):
 
     def execute(self, context):
         stream.invalidate_all(close=True)
+        instances.close_atom_assets()
         return {'FINISHED'}
 
 
