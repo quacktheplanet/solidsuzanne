@@ -947,7 +947,7 @@ ATOM_FACE_ATTR = "vgeo_atom_local"
 ATOMS_NODE_GROUP = "VGEO Atoms"
 LIBRARY_NODE_GROUP = "VGEO Atom Library"
 ATOM_SLICE = 512
-USE_BLOCKS = os.environ.get("VGEO_BLOCKS", "1") == "1"   # blocks: atoms of one parent group as one piece
+USE_BLOCKS = os.environ.get("VGEO_BLOCKS", "0") == "1"   # blocks: fewer instances, one more DAG of memory
 SLICE_PROP = "vgeo_atom_slice"   # on a cloud object: its slice index
 LIB_PROP = "vgeo_atom_library"   # on a library object: its slice index
 

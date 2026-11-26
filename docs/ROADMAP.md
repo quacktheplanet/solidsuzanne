@@ -197,8 +197,11 @@ default; branch `phase2-atoms`):
       leave the instancing, final render cut, save/load, switching back.
 - [x] Parent-merged blocks: the atoms of one parent group drawn as one piece
       when all are in a copy's cut (statue avenue: 17-33 % fewer instances, same
-      triangles; costs one more copy of the DAG's geometry in Blender meshes,
-      the avenue .blend grows from 303 to 397 MB).
+      triangles). Off by default: one more copy of the DAG's geometry in Blender
+      (+0.64 GB, .blend 303 -> 397 MB) for an fps gain within noise.
+- [x] T4: the statue avenue renders with meshlet instancing at 3.3-3.4 GB peak
+      RSS (today 1.7-2.2 GB); EEVEE 0.65 s / Cycles 1.30 s a frame at 1280x720,
+      16 samples (today 0.57 / 1.47).
 - [ ] Proxies as single-copy instancers; retire chunk meshes and streamed copies
       (needs the owner's go).
 

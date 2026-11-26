@@ -239,9 +239,11 @@ every copy its own meshlet cut, built from pieces that never change:
   fixed detail. `vgeo_select_instances` selects the cut of every copy in one
   native call (Off-screen modes per atom, multithreaded over copies) and
   returns (copy, atom) pairs: 2-7 ms for 1,700 copies.
-- **Blocks.** The atoms simplified from one parent group are drawn as one
-  piece when all of them made a copy's cut: same triangles, 17-44 % fewer
-  instances, one more copy of the DAG's geometry in Blender.
+- **Blocks** (off by default, `VGEO_BLOCKS=1`). The atoms simplified from one
+  parent group can be drawn as one piece when all of them made a copy's cut:
+  same triangles, 17-44 % fewer instances, but one more copy of the DAG's
+  geometry in Blender (+0.64 GB on the statue avenue) for an fps gain within
+  measuring noise.
 - **Libraries, not objects.** Each slice of 512 atoms and blocks is one mesh
   (the piece's index as a face attribute) on a library object whose Split to
   Instances runs once. Thousands of atom objects would cost every depsgraph
@@ -276,6 +278,13 @@ A meshlet cut on every copy with off-screen copies skipped (the browser
 library's rule) draws 1.24M and 5.91M: meshlet instancing is within 6 % of it
 in Shadows mode and at or under it in Cull (whole copies outside the view are
 skipped by the asset's bounds, tighter than the per-cluster spheres).
+
+Memory and final renders (statue avenue, 8 frames along the film path,
+1280x720, 16 samples, `tools/render_memory_bench.py`): the atom libraries hold
+about one more copy of each asset's DAG (6.1M triangles, ~200 bytes each in
+Blender, plus the evaluated split). Peak RSS 3.3 GB (EEVEE) / 3.4 GB (Cycles)
+against 1.7 / 2.2 GB today; EEVEE 0.65 s a frame (0.57 today), Cycles 1.30 s
+(1.47 today). The 4.36-billion-triangle scene renders in well under 16 GB.
 
 **Occlusion Culling** (with Meshlet Instancing, off by default) draws the
 nearest copies' coarse levels into a 256x144 CPU depth buffer (pushed back by

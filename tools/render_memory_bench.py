@@ -250,4 +250,5 @@ def main():
             json.dump({"summary": summary, "frames": log}, f, indent=1)
 
 
-main()
+if __name__ == "__main__":
+    main()
