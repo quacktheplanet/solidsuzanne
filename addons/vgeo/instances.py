@@ -921,10 +921,11 @@ LIB_PROP = "vgeo_atom_library"   # on a library object: its slice index
 ATOM_MOVING_INTERVAL = float(os.environ.get("VGEO_ATOM_INTERVAL", 0.2))   # seconds between viewport cut
                                                                          # updates while the view moves
 
-# What drawing one more instance costs, in triangles: EEVEE spends ~2 us per instance per frame
-# (phase 2 spike), about what it spends on 300 triangles. In the viewport each copy is drawn as its
-# atoms or as one whole level mesh, whichever costs less by this measure.
-INSTANCE_COST = float(os.environ.get("VGEO_INSTANCE_COST", 300))
+# EEVEE spends ~2 us per instance per frame however small (phase 2 spike), and how many triangles
+# that is worth depends on the scene (300 on the statue avenue, 2,700 on the synthetic field). So the
+# viewport has an instance budget per instancer: every drawn copy starts as one whole level mesh, and
+# copies switch to their atoms in order of triangles saved per extra instance while the budget lasts.
+INSTANCE_BUDGET = int(os.environ.get("VGEO_INSTANCE_BUDGET", 8000))
 
 _atom_assets = {}   # instancer uid -> native.Asset (own handle, memory-mapped)
 _atom_state = {}    # (instancer uid, slice) -> last pairs written to that cloud
@@ -1288,9 +1289,9 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
     n = len(inst.data.vertices)
     levels = np.full(n, -1, np.int32)   # copies drawn as atoms show no level mesh
     tris = int(st.triangles)
-    if paced and INSTANCE_COST > 0 and len(pairs):
-        # viewport: a copy whose atoms cost more (triangles plus instances) than its whole level
-        # mesh is drawn as the level mesh instead (final renders always draw atoms: fewer triangles)
+    if paced and INSTANCE_BUDGET > 0 and len(pairs) > INSTANCE_BUDGET:
+        # viewport over budget: some copies are drawn as one whole level mesh instead of their atoms
+        # (final renders always draw atoms: fewer triangles, and renderers cope with the instances)
         atom_tris = np.asarray(inst.get("vgeo_atom_tris", []), np.int64)
         if len(atom_tris):
             lv, _budget = _choose(inst, views, pixel_error, mode, offscreen_scale)
@@ -1299,12 +1300,20 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
             a_tris = np.bincount(c, weights=atom_tris[pairs[:, 1]], minlength=n)
             a_count = np.bincount(c, minlength=n)
             l_tris = np.where(lv >= 0, lvl_tris[np.maximum(lv, 0)], 0)
-            use_level = (lv >= 0) & (a_count > 1) & (l_tris + INSTANCE_COST < a_tris + INSTANCE_COST * a_count)
+            use_level = (lv >= 0) & (a_count > 1)          # candidates for the level fallback
+            # instances if every candidate were a level mesh, and what switching each back to atoms
+            # costs (extra instances) and saves (triangles)
+            base = int(a_count[~use_level].sum() + use_level.sum())
+            extra = (a_count - 1).astype(np.float64)
+            gain = (l_tris - a_tris).astype(np.float64)
+            cand = np.nonzero(use_level & (gain > 0))[0]
+            order = cand[np.argsort(-gain[cand] / extra[cand], kind="stable")]
+            fits = np.cumsum(extra[order]) <= max(0, INSTANCE_BUDGET - base)
+            use_level[order[fits]] = False
             if use_level.any():
                 levels[use_level] = lv[use_level]
-                keep = ~use_level[c]
                 tris = int(a_tris[~use_level].sum() + l_tris[use_level].sum())
-                pairs = pairs[keep]
+                pairs = pairs[~use_level[c]]
     changed = _write_atom_points(inst, pairs) > 0
     changed |= apply_levels(inst, levels)
     inst.vgeo_inst.shown_triangles = int(min(tris, 2**31 - 1))
