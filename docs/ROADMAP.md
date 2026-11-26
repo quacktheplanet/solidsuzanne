@@ -202,8 +202,12 @@ default; branch `phase2-atoms`):
 - [x] T4: the statue avenue renders with meshlet instancing at 3.3-3.4 GB peak
       RSS (today 1.7-2.2 GB); EEVEE 0.65 s / Cycles 1.30 s a frame at 1280x720,
       16 samples (today 0.57 / 1.47).
+- [x] On by default for new instancers (Scatter, Virtualize Instances); files
+      saved before keep their setting.
+- [x] Atom libraries are not saved in the .blend; refilled from the .vgeo after
+      opening (statue avenue: 162 MB file instead of 320 MB).
 - [ ] Proxies as single-copy instancers; retire chunk meshes and streamed copies
-      (needs the owner's go).
+      (owner's go given November 2026).
 
 T1, triangles drawn (`tools/instancing_bench.py`, 1280x720, the bench's error):
 

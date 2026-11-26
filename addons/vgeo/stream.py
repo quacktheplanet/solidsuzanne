@@ -981,6 +981,8 @@ def _on_load(_a=None, _b=None):
 
 @persistent
 def _on_save(_a=None, _b=None):
+    from . import instances
+    instances.detach_libraries()   # atom libraries are rebuilt from the .vgeo after opening
     # hidden backs would double the saved geometry; only the shown cut goes into the file
     for obj in proxies():
         rt = _runtimes.get(obj.vgeo.uid)
@@ -989,6 +991,12 @@ def _on_save(_a=None, _b=None):
                 clear_backs(obj, rt)
             except Exception as e:
                 print("VGEO save:", e)
+
+
+@persistent
+def _on_save_post(_a=None, _b=None):
+    from . import instances
+    instances.attach_libraries()
 
 
 @persistent
@@ -1005,7 +1013,7 @@ def new_uid():
 def register():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save), (h.save_post, _on_save_post),
                     (h.undo_post, _on_undo), (h.redo_post, _on_undo),
                     (h.frame_change_post, _on_frame_change_post)):
         if fn not in lst:
@@ -1017,7 +1025,7 @@ def register():
 def unregister():
     h = bpy.app.handlers
     for lst, fn in ((h.render_pre, _on_render_pre), (h.render_complete, _on_render_done),
-                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save),
+                    (h.render_cancel, _on_render_done), (h.load_post, _on_load), (h.save_pre, _on_save), (h.save_post, _on_save_post),
                     (h.undo_post, _on_undo), (h.redo_post, _on_undo),
                     (h.frame_change_post, _on_frame_change_post)):
         while fn in lst:

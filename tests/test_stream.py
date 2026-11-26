@@ -446,6 +446,9 @@ def run():
     check("new instancers default to Shadows, the property (old files) to Coarsen",
           inst.vgeo_inst.offscreen == 'SHADOWS'
           and type(inst.vgeo_inst).bl_rna.properties["offscreen"].default == 'COARSEN')
+    check("new instancers use meshlet instancing", inst.vgeo_inst.use_atoms == native.has_atoms()
+          and not type(inst.vgeo_inst).bl_rna.properties["use_atoms"].default)
+    inst.vgeo_inst.use_atoms = False       # the checks below are about whole-copy levels and streamed copies
     inst.vgeo_inst.offscreen = 'COARSEN'   # the checks below were written against Coarsen
     errs = list(inst["vgeo_level_errors"])
     lvl_tris = list(inst["vgeo_level_tris"])
@@ -792,9 +795,13 @@ def run():
         check("atom clouds hide with their instancer", hidden_r and hidden_v and clouds
               and all(o.visible_get() and not o.hide_render for o in clouds))
         bpy.ops.wm.save_mainfile()
+        kept = all(len(o.data.polygons) for o in instances.atom_libraries(inst).values())
         bpy.ops.wm.open_mainfile(filepath=os.path.join(OUT, "stream_test.blend"))
         inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid)
         scene = bpy.context.scene
+        empty = all(o.data.name == instances.EMPTY_LIBRARY for o in instances.atom_libraries(inst).values())
+        check("atom libraries are not saved (refilled from the .vgeo), and stay in the session",
+              kept and empty and instances.atom_libraries(inst))
         camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
         views = [stream.camera_view(bpy.context.scene)]
         instances.update(inst, views, 1.0)

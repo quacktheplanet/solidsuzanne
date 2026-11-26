@@ -68,8 +68,8 @@ class VGEOInstanceSettings(bpy.types.PropertyGroup):
     levels: PointerProperty(type=bpy.types.Collection, name="Levels")
     use_atoms: BoolProperty(
         name="Meshlet Instancing", default=False,
-        description="Experimental: draw every copy as its own meshlet cut, made of instanced pieces of the "
-                    "asset (cut atoms) that never change, instead of whole-asset levels and streamed copies",
+        description="Draw every copy as its own meshlet cut, made of instanced pieces of the asset (cut "
+                    "atoms) that never change, instead of whole-asset levels and streamed copies",
         update=lambda self, ctx: instances.set_use_atoms(self.id_data, self.use_atoms))
     use_occlusion: BoolProperty(
         name="Occlusion Culling", default=False,
@@ -440,8 +440,8 @@ class VGEO_OT_virtualize_instances(bpy.types.Operator):
     bl_label = "Virtualize Instances"
     bl_options = {'REGISTER', 'UNDO'}
 
-    meshlet_instancing: BoolProperty(name="Meshlet Instancing", default=False,
-                                     description="Draw every copy as its own meshlet cut (experimental)")
+    meshlet_instancing: BoolProperty(name="Meshlet Instancing", default=True,
+                                     description="Draw every copy as its own meshlet cut")
 
     @classmethod
     def poll(cls, context):
@@ -464,8 +464,8 @@ class VGEO_OT_virtualize_instances(bpy.types.Operator):
             self.report({'WARNING'}, f"Non-uniform instance scale approximated (up to {spread:.0%} apart)")
         views = stream.viewport_views() if context.window_manager.windows else []
         for inst in made:
-            if self.meshlet_instancing and native.has_atoms():
-                inst.vgeo_inst.use_atoms = True
+            if not self.meshlet_instancing:
+                inst.vgeo_inst.use_atoms = False
             if views:
                 instances.update(inst, views, inst.vgeo_inst.pixel_error)
         n = sum(len(i.data.vertices) for i in made)

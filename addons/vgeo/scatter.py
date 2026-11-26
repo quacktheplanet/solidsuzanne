@@ -19,7 +19,7 @@ import math
 import bpy
 import numpy as np
 
-from . import instances, stream
+from . import instances, native, stream
 
 HIDE_GROUP = "VGEO Hide Instances"
 HIDE_MODIFIER = "VGEO Hide Instances"
@@ -143,6 +143,8 @@ def make_instancer(context, proxy, mats, name, collections):
     vi.offscreen = 'SHADOWS'
     try:
         instances.build_levels(inst, proxy)
+        if native.has_atoms():
+            vi.use_atoms = True
     except RuntimeError:
         col = vi.levels
         bpy.data.objects.remove(inst)

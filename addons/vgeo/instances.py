@@ -925,6 +925,8 @@ def create_instancer(context, source, surface, count, seed=0, scale_range=(0.7, 
     # default stays Coarsen so files saved before this keep rendering what they did
     inst.vgeo_inst.offscreen = 'SHADOWS'
     build_levels(inst, source)
+    if native.has_atoms():   # new instancers draw a meshlet cut per copy (old files keep their setting)
+        inst.vgeo_inst.use_atoms = True
     return inst
 
 
@@ -1048,6 +1050,7 @@ def close_atom_assets():
     _atom_state.clear()
     _atom_clouds.clear()
     _atom_pace.clear()
+    _libs_checked.clear()
 
 
 def atom_libraries(inst):
@@ -1111,9 +1114,10 @@ def _remove_objects(obs):
 
 
 def build_atoms(inst):
-    """Build the instancer's atom libraries: one mesh per slice of ATOM_SLICE atoms, with the atom's
-    index in the slice as a face attribute, on a library object (in a collection only Geometry Nodes
-    reads) that splits it into one instance per atom."""
+    """Build (or refill) the instancer's atom libraries: one mesh per slice of ATOM_SLICE pieces, with
+    the piece's index in the slice as a face attribute, on a library object (in a collection only
+    Geometry Nodes reads) that splits it into one instance per piece. Existing library objects are
+    refilled in place, so the clouds that read them keep working."""
     vi = inst.vgeo_inst
     uid = vi.uid
     asset = _atom_asset(inst)
@@ -1127,11 +1131,13 @@ def build_atoms(inst):
     for sub in list(col.children):   # an older layout: object per atom, collection per slice
         _remove_objects(sub.objects)
         bpy.data.collections.remove(sub)
-    _remove_objects(col.objects)
-    _remove_objects(atom_clouds(inst).values())
+    n_slices = -(-units // ATOM_SLICE)
+    libs = atom_libraries(inst)
+    _remove_objects([o for k, o in libs.items() if k >= n_slices])
+    _remove_objects([o for k, o in atom_clouds(inst).items() if k >= n_slices])
     materials = tuple(vi.source.data.materials)
     lib_ng = ensure_library_node_group()
-    for k in range(-(-units // ATOM_SLICE)):
+    for k in range(n_slices):
         lo, hi = k * ATOM_SLICE, min(units, (k + 1) * ATOM_SLICE)
         parts, local = [], []
         for a in range(lo, hi):
@@ -1146,18 +1152,76 @@ def build_atoms(inst):
         data = _concat(parts)
         stream.fill_mesh(me, data, materials, False)
         me.attributes.new(ATOM_FACE_ATTR, 'INT', 'FACE').data.foreach_set("value", np.concatenate(local))
-        ob = bpy.data.objects.new(name, me)
-        ob[LIB_PROP] = k
-        mod = ob.modifiers.new("VGEO Atom Library", 'NODES')
-        mod.node_group = lib_ng
-        col.objects.link(ob)
+        ob = libs.get(k)
+        if ob is None:
+            ob = bpy.data.objects.new(name, me)
+            ob[LIB_PROP] = k
+            mod = ob.modifiers.new("VGEO Atom Library", 'NODES')
+            mod.node_group = lib_ng
+            col.objects.link(ob)
+        else:
+            old = ob.data
+            ob.data = me
+            if old is not None and old.users == 0:
+                bpy.data.meshes.remove(old)
+            me.name = name
     inst["vgeo_atom_tris"] = [int(t) for t in np.concatenate([atoms["tri_count"], blocks["tri_count"]])]
     inst["vgeo_atom_count"] = len(atoms)
     for key in [k for k in _atom_state if k[0] == uid]:
         del _atom_state[key]
     _atom_clouds.pop(uid, None)
     _atom_pace.pop(uid, None)
+    _libs_checked.add(uid)
     return len(atoms)
+
+
+# ---- the libraries are derived data: not saved, refilled from the .vgeo after a file opens
+
+EMPTY_LIBRARY = ".vgeo empty library"
+_detached = {}        # library object name -> its mesh, while a save runs
+_libs_checked = set()  # instancer uids whose libraries are known to be filled (this session)
+
+
+def detach_libraries():
+    """Before a save: give every library object an empty mesh, so its geometry (which has then no
+    users) is not written; attach_libraries() puts it back."""
+    empty = bpy.data.meshes.get(EMPTY_LIBRARY) or bpy.data.meshes.new(EMPTY_LIBRARY)
+    for ob in bpy.data.objects:
+        if LIB_PROP in ob and ob.data is not None and ob.data != empty:
+            _detached[ob.name] = ob.data
+            ob.data = empty
+
+
+def attach_libraries():
+    for name, me in list(_detached.items()):
+        ob = bpy.data.objects.get(name)
+        if ob is not None and me is not None:
+            try:
+                ob.data = me
+            except ReferenceError:
+                pass
+    _detached.clear()
+
+
+def ensure_libraries(inst):
+    """Refill the atom libraries if they were saved empty (a file just opened). True when filled."""
+    uid = inst.vgeo_inst.uid
+    if uid in _libs_checked:
+        return True
+    libs = atom_libraries(inst)
+    if libs and all(o.data is not None and o.data.name != EMPTY_LIBRARY and len(o.data.polygons)
+                    for o in libs.values()):
+        _libs_checked.add(uid)
+        return True
+    try:
+        build_atoms(inst)
+    except RuntimeError as e:   # the asset cannot be opened
+        print("VGEO: cannot refill atom libraries:", e)
+        return False
+    if inst.vgeo_inst.use_atoms:
+        _ensure_clouds(inst)
+        sync_cloud_visibility(inst)
+    return True
 
 
 def rebuild_atoms(inst):
@@ -1212,6 +1276,8 @@ def set_use_atoms(inst, on):
             return
         if vi.atoms is None or not atom_libraries(inst):
             build_atoms(inst)
+        else:
+            ensure_libraries(inst)
         _ensure_clouds(inst)
         sync_cloud_visibility(inst)
         flags = _streamed_flags(inst)   # streamed copies are not needed: every copy is cut
@@ -1357,6 +1423,8 @@ def update_atoms(inst, views, pixel_error, mode=None, offscreen_scale=None, pace
         _atom_pace[uid] = [now, key, key]
     else:
         _atom_pace.pop(uid, None)
+    if not ensure_libraries(inst):
+        return False
     asset = _atom_asset(inst)
     pairs, st = select_atoms(inst, asset, views, pixel_error, mode, offscreen_scale, occlusion=True)
     n = len(inst.data.vertices)

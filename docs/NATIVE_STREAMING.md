@@ -227,12 +227,13 @@ the boulder's streamed cut is 353k triangles instead of 1.31M for level 0,
 and it takes over 0.85-0.95 s after the view arrives (5.0.1 and 5.1.2,
 Solid and EEVEE).
 
-## Meshlet Instancing (experimental)
+## Meshlet Instancing
 
 Whole-copy levels draw a copy at the detail its nearest point needs, so they
 cost about twice a meshlet cut, and streamed copies only help a few heavy
-copies. **Meshlet Instancing** (an instancer option, off by default) gives
-every copy its own meshlet cut, built from pieces that never change:
+copies. **Meshlet Instancing** (an instancer option, on for instancers made
+by Scatter or Virtualize Instances; instancers in older files keep what they
+had) gives every copy its own meshlet cut, built from pieces that never change:
 
 - **Atoms.** The clusters sharing a (group, refined) pair are always in or out
   of the cut together, so each such set is a fixed piece of the asset at a
@@ -262,6 +263,10 @@ every copy its own meshlet cut, built from pieces that never change:
   renders always draw the full atom cut.
 - **Visibility** of the clouds follows the instancer; a deleted instancer's
   clouds leave the scene.
+- **Not saved.** The libraries are derived from the `.vgeo`, so saving swaps
+  in an empty mesh for each (the .blend stays the size it would be without
+  them: 162 MB for the statue avenue instead of 320 MB) and the first update
+  after opening refills them (about 2 s for the avenue).
 
 Measured against today's path (`tools/instancing_bench.py`, 1280x720, the
 bench error; `tests/viewport_bench.py --cameras ... --offscreen SHADOWS`,
