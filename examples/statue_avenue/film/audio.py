@@ -1,17 +1,25 @@
-"""Synthesizes the soundtrack (60 s, 48 kHz stereo WAV): ambient pad, wipe whooshes, dial ticks, hits."""
+"""Synthesizes the soundtrack (48 kHz stereo WAV): ambient pad, wipe whooshes, hits on the timeline's cuts,
+wipes and freeze, all read from timeline.py, so the score follows the edit."""
 import numpy as np
 import os
+import sys
 import wave
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import timeline as T  # noqa: E402
+
 SR = 48000
-DUR = 66.0
+DUR = T.DURATION
 N = int(SR * DUR)
 t = np.arange(N) / SR
 rng = np.random.default_rng(3)
 
-WIPES = [(23.4, 25.4), (34.0, 36.0), (45.6, 47.4)]
-CUTS = [12.0, 22.0, 57.0]
-DIAL = [(37.0, 39.2, +1), (42.6, 44.8, -1)]
+WIPES = [(a, b) for a, b, _fr, _to in T.WIPES]
+# wipes that switch the Off-screen mode get a brighter accent
+MODE_WIPES = [(a, b) for a, b, fr, to in T.WIPES if T.VIEWS[fr][1] != T.VIEWS[to][1]]
+CUTS = list(T.CUTS)
+FREEZE = T.FREEZE
+END = T.SHOTS[-1][1] + 1.5      # the end card comes up shortly into the last shot
 
 
 def hz(note):
@@ -56,12 +64,14 @@ def fft_bandpass(x, lo, hi, order=2):
 
 # ---------------------------------------------------------------- pad
 CHORDS = [
-    (0.0, 12.0, ["C2", "G2", "D3", "E3", "B3"]),
-    (12.0, 22.0, ["A1", "E2", "C3", "G3", "B3"]),
-    (22.0, 34.0, ["F2", "C3", "A3", "E4", "G4"]),
-    (34.0, 45.6, ["G2", "D3", "B3", "F#4", "A4"]),
-    (45.6, 57.0, ["E2", "B2", "G3", "D4", "F#4"]),
-    (57.0, 66.0, ["C2", "G2", "D3", "E3", "G4"]),
+    (0.0, 9.0, ["C2", "G2", "D3", "E3", "B3"]),
+    (9.0, 16.0, ["A1", "E2", "C3", "G3", "B3"]),
+    (16.0, 30.0, ["F2", "C3", "A3", "E4", "G4"]),
+    (30.0, 40.0, ["G2", "D3", "B3", "F#4", "A4"]),
+    (40.0, 47.0, ["D2", "A2", "F3", "C4", "E4"]),
+    (47.0, 59.0, ["E2", "B2", "G3", "D4", "F#4"]),
+    (59.0, 66.5, ["F2", "C3", "G3", "A3", "E4"]),
+    (66.5, DUR, ["C2", "G2", "D3", "E3", "G4"]),
 ]
 pad = np.zeros((N, 2))
 for ci, (a, b, notes) in enumerate(CHORDS):
@@ -91,7 +101,7 @@ pad = fft_lowpass(pad, 1400, 2)
 pad *= 0.11
 
 # sub drone on A1, swelling under the title and the end card
-sub = np.sin(2 * np.pi * hz("C2") / 2 * t) * (0.5 + 0.5 * env_window(1.5, 11, 2.5, 3) + 0.6 * env_window(59.5, 66, 2.0, 2.0))
+sub = np.sin(2 * np.pi * hz("C2") / 2 * t) * (0.5 + 0.5 * env_window(1.5, 9, 2.5, 3) + 0.6 * env_window(END - 1.0, DUR, 2.0, 2.0))
 sub *= 0.05 * smooth(t / 3.0)
 pad += np.stack([sub, sub], 1)
 
@@ -158,7 +168,7 @@ def tick(f=2400):
 
 # title + end hits
 add(boom(), 2.1, 0.55)
-add(boom(4.5, 55, 30), 60.4, 0.6)
+add(boom(4.5, 55, 30), END, 0.6)
 # the star clearing the giant's limb: rising shimmer swell
 n = int(4.5 * SR); tt = np.arange(n) / SR
 swell = sum(np.sin(2 * np.pi * f * tt + i) / (i + 1) for i, f in enumerate((880, 1318.5, 1760, 2637)))
@@ -171,19 +181,17 @@ for c in CUTS:
 for a, b in WIPES:
     add(whoosh(b - a + 0.4), a - 0.2, 0.32)
     add(shimmer(), b - 0.25, 0.05, 0.6)
-# dial ticks: rate follows the error ramp
-for a, b, direction in DIAL:
-    tt0 = a
-    while tt0 < b:
-        u = (tt0 - a) / (b - a)
-        k = u if direction > 0 else 1 - u
-        add(tick(1600 + 1800 * k), tt0, 0.10, 0.5 + 0.25 * (k - 0.5))
-        tt0 += 1 / (9 + 16 * np.sin(np.pi * u))
-# freeze: a glassy 'lock' and a held high tone while the camera pulls back
-add(shimmer((2349, 3136, 4699), 3.0), 45.55, 0.09, 0.5)
-n = int(11.0 * SR); tt = np.arange(n) / SR
-hold = (np.sin(2 * np.pi * 1174.7 * tt) + 0.5 * np.sin(2 * np.pi * 1760 * tt + 1.0)) * smooth(tt / 1.5) * (1 - smooth((tt - 9.6) / 1.2))
-add(hold * (0.8 + 0.2 * np.sin(2 * np.pi * 0.25 * tt)), 45.8, 0.025, 0.5)
+# Off-screen mode switches: a tick and a low knock on top of the whoosh
+for a, b in MODE_WIPES:
+    mid = (a + b) / 2
+    add(tick(2000), mid, 0.12, 0.5)
+    add(boom(1.0, 120, 70), mid, 0.12)
+# freeze: a glassy 'lock' and a held high tone while the camera pulls back and the cut stays put
+add(shimmer((2349, 3136, 4699), 3.0), FREEZE[0] + 0.05, 0.09, 0.5)
+held = FREEZE[3] - FREEZE[0] - 0.4
+n = int(held * SR); tt = np.arange(n) / SR
+hold = (np.sin(2 * np.pi * 1174.7 * tt) + 0.5 * np.sin(2 * np.pi * 1760 * tt + 1.0)) * smooth(tt / 1.5) * (1 - smooth((tt - (held - 1.4)) / 1.2))
+add(hold * (0.8 + 0.2 * np.sin(2 * np.pi * 0.25 * tt)), FREEZE[0] + 0.3, 0.025, 0.5)
 
 # ---------------------------------------------------------------- reverb + master
 ir_n = int(3.2 * SR)
@@ -196,7 +204,7 @@ L = N + ir_n
 wet = np.stack([np.fft.irfft(np.fft.rfft(mix[:, c], L) * np.fft.rfft(ir[:, c], L), L)[:N] for c in (0, 1)], 1)
 out = mix * 0.82 + wet * 0.30
 
-fade = smooth(t / 1.4) * (1 - smooth((t - 64.4) / 1.6))
+fade = smooth(t / 1.4) * (1 - smooth((t - (DUR - 1.6)) / 1.6))
 out *= fade[:, None]
 out = np.tanh(out * 1.2) / np.tanh(1.2)
 peak = np.abs(out).max()

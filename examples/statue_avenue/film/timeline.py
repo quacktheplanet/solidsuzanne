@@ -1,17 +1,48 @@
-"""Shot list for the Solid Suzanne Blender demo (Z up, avenue along +Y)."""
+"""Shot list for the Solid Suzanne phase 1 demo (Z up, avenue along +Y, low sun toward -X/+Y).
+
+state(t) returns everything a frame needs: camera, view (material mode + Off-screen mode + tint),
+the incoming view and wipe progress during wipes, the error budget, and the frozen "eye" camera
+whose cut is kept while the camera flies out to look at it.
+"""
 import math
 
 FPS = 24
-DURATION = 66.0
+DURATION = 74.0
 FRAMES = int(FPS * DURATION)
 ERR = 1.0
-ERR_MAX = 8.0
 
-SHOTS = [("avenue", 0.0, 12.0), ("closeup", 12.0, 22.0), ("breakdown", 22.0, 57.0), ("finale", 57.0, 66.0)]
-CUTS = (12.0, 22.0, 57.0)
-WIPES = [(23.4, 25.4, "beauty", "meshlod"), (34.0, 36.0, "meshlod", "facetlod"), (45.6, 47.4, "facetlod", "meshlod")]
-DIAL = (37.0, 39.2, 42.6, 44.8)
-FREEZE = (45.5, 47.0, 54.5, 57.0)    # freeze from, pull-back start, pull-back end, end
+# (name, start, end): segments the compositor encodes separately (cuts between them)
+SHOTS = [("open", 0.0, 9.0), ("closeup", 9.0, 16.0), ("flight", 16.0, 47.0), ("frozen", 47.0, 59.0),
+         ("payoff", 59.0, 66.5), ("finale", 66.5, 74.0)]
+CUTS = (9.0, 16.0, 47.0, 59.0, 66.5)
+
+# views: material mode (0 beauty, 1 meshlets + LOD ramp), the instancers' Off-screen mode, tint on
+# the streamed copies (0/1)
+VIEWS = {
+    "beauty": (0, "COARSEN", 0),
+    "meshlod": (1, "COARSEN", 0),
+    "tint": (0, "COARSEN", 1),
+    "lod_coarsen": (1, "COARSEN", 0),
+    "lod_shadows": (1, "SHADOWS", 0),
+    "lod_cull": (1, "CULL", 0),
+    "sun_cull": (0, "CULL", 0),
+    "sun_shadows": (0, "SHADOWS", 0),
+}
+# (start, end, from view, to view); between wipes the last "to" view holds
+WIPES = [(16.8, 18.6, "beauty", "meshlod"),
+         (30.0, 31.6, "meshlod", "tint"),
+         (39.6, 41.2, "tint", "meshlod"),
+         (52.4, 53.8, "lod_coarsen", "lod_shadows"),
+         (55.6, 57.0, "lod_shadows", "lod_cull"),
+         (61.6, 63.4, "sun_cull", "sun_shadows")]
+FIRST_VIEW = {"open": "beauty", "closeup": "beauty", "flight": "beauty", "frozen": "lod_coarsen",
+              "payoff": "sun_cull", "finale": "beauty"}
+
+# sections: (start, end, key) - the compositor holds their titles and captions
+SECTIONS = [(17.0, 30.0, "meshlets"), (30.0, 40.0, "streamed"), (40.0, 47.0, "before"),
+            (47.2, 59.0, "offscreen"), (59.2, 66.5, "payoff")]
+
+FREEZE = (47.0, 47.6, 51.2, 59.0)   # freeze at, pull-back start, pull-back end, end
 
 
 def clamp01(x):
@@ -55,41 +86,64 @@ def catmull(pts, k):
                  for a, b, c, d in zip(p0, p1, p2, p3))
 
 
-# S4 fly-by along the right row at head height; S5 eye = its end
-FLY = [(-1.0, 8.0, 6.0), (2.0, 60.0, 7.0), (4.0, 120.0, 7.4), (4.5, 168.0, 7.4)]
-EYE = {"pos": (4.5, 168.0, 7.4), "target": (2.5, 260.0, 5.5), "fov": 62.0}
+# the flight: down the avenue (breakdown), then close along the right row past the statues' heads
+# (streamed copies), then on down the avenue (before/after); its end is the frozen eye
+FLIGHT = [(-3.0, -20.0, 4.0), (-1.0, 10.0, 5.5), (3.5, 50.0, 6.4), (6.2, 92.0, 6.2), (6.4, 132.0, 6.2),
+          (4.5, 176.0, 7.0), (3.0, 214.0, 7.4)]
+EYE = {"pos": (3.0, 214.0, 7.4), "target": (1.5, 306.0, 5.5), "fov": 62.0}
+VANTAGE, VANTAGE_LOOK = (-88.0, 150.0, 92.0), (10.0, 262.0, 0.0)
+# the payoff: ground level in the avenue, looking away from the low sun (toward +X/-Y), the statues
+# behind the camera throw long shadows into the view
+# (found by rendering candidates in both modes and keeping the one where Cull loses the most shadow)
+PAYOFF_A = {"pos": (0.0, 344.0, 2.2), "target": (16.9, 307.7, -0.2), "fov": 60.0}
+PAYOFF_B = {"pos": (0.5, 337.0, 2.4), "target": (17.4, 300.7, 0.0), "fov": 60.0}
+
+
+def flight_state(t):
+    u = cruise((t - 16.0) / (47.0 - 16.0), 0.12)
+    k = u * (len(FLIGHT) - 1)
+    pos = catmull(FLIGHT, k)
+    ahead = catmull(FLIGHT, min(len(FLIGHT) - 1.0, k + 0.35))
+    look = (lerp(1.0, 1.5, u), ahead[1] + 92.0, lerp(3.5, 5.5, u))
+    # past the statues (30-40 s) the camera turns toward the right row, where the streamed copies are
+    turn = smooth((t - 29.0) / 2.5) * (1 - smooth((t - 38.5) / 2.5))
+    look = lerp3(look, (12.0, pos[1] + 26.0, 4.6), 0.62 * turn)
+    return {"pos": pos, "target": look, "fov": lerp(58.0, 62.0, u)}
 
 
 def state(t):
     st = {"roll": 0.0}
-    if t < 12.0:
-        u = cruise(t / 12.0, 0.25)
-        st.update(pos=lerp3((-1.6, -62.0, 2.0), (-0.9, -24.0, 2.6), u),
+    if t < 9.0:
+        u = cruise(t / 9.0, 0.25)
+        st.update(pos=lerp3((-1.6, -64.0, 1.8), (-1.0, -30.0, 2.7), u),
                   target=lerp3((0.0, 200.0, 12.0), (0.0, 200.0, 11.0), u), fov=52.0, roll=0.012)
-    elif t < 22.0:
-        u = cruise((t - 12.0) / 10.0, 0.25)
+    elif t < 16.0:
+        u = cruise((t - 9.0) / 7.0, 0.25)
         # right-row statue at y = 24 faces -X: slide past her sunlit face
         st.update(pos=lerp3((-1.0, 17.0, 4.9), (0.4, 29.5, 5.4), u),
                   target=lerp3((9.8, 22.8, 6.0), (9.8, 25.0, 6.2), u), fov=40.0)
-    elif t < 34.0:
-        u = cruise((t - 22.0) / 12.0, 0.3)
-        st.update(pos=lerp3((-3.5, -18.0, 4.0), (-1.0, 8.0, 6.0), u), target=lerp3((1.0, 180.0, 3.0), (1.5, 200.0, 4.0), u), fov=58.0)
     elif t < FREEZE[0]:
-        u = cruise((t - 34.0) / (FREEZE[0] - 34.0), 0.18)
-        pos = catmull(FLY, u * (len(FLY) - 1))
-        st.update(pos=pos, target=(lerp(1.5, 2.5, u), pos[1] + 92.0, lerp(4.0, 5.5, u)), fov=lerp(58.0, 62.0, u))
+        st.update(flight_state(t))
     elif t < FREEZE[3]:
         u = cruise((t - FREEZE[1]) / (FREEZE[2] - FREEZE[1]), 0.3)
-        vantage, look = (-62.0, 110.0, 70.0), (6.0, 230.0, 0.0)
-        st.update(pos=lerp3(EYE["pos"], vantage, u), target=lerp3(EYE["target"], look, u), fov=lerp(62.0, 66.0, u))
+        st.update(pos=lerp3(EYE["pos"], VANTAGE, u), target=lerp3(EYE["target"], VANTAGE_LOOK, u),
+                  fov=lerp(62.0, 66.0, u))
         st["eye"] = EYE
+    elif t < 66.5:
+        u = cruise((t - 59.0) / 7.5, 0.3)
+        st.update(pos=lerp3(PAYOFF_A["pos"], PAYOFF_B["pos"], u), target=lerp3(PAYOFF_A["target"], PAYOFF_B["target"], u),
+                  fov=60.0)
     else:
-        u = cruise((t - 57.0) / 9.0, 0.2)
+        u = cruise((t - 66.5) / 7.5, 0.2)
         st.update(pos=lerp3((-19.0, 44.0, 10.0), (-25.0, 34.0, 19.0), u),
                   target=lerp3((24.0, 400.0, 5.0), (26.0, 420.0, 9.0), u), fov=58.0, roll=-0.02)
 
-    view, viewB, wipe = "beauty", None, None
+    shot = next(name for name, a, b in SHOTS if a <= t < b) if t < DURATION else SHOTS[-1][0]
+    view, viewB, wipe = FIRST_VIEW[shot], None, None
+    s0, s1 = next((a, b) for name, a, b in SHOTS if name == shot)
     for (a, b, fr, to) in WIPES:
+        if not (s0 <= a < s1):
+            continue
         if t >= b:
             view = to
         elif t >= a:
@@ -97,11 +151,5 @@ def state(t):
             break
         else:
             break
-    if t >= 57.0 or t < 22.0:
-        view, viewB, wipe = "beauty", None, None
-    err = ERR
-    if DIAL[0] <= t < DIAL[3]:
-        k = smooth((t - DIAL[0]) / (DIAL[1] - DIAL[0])) * (1 - smooth((t - DIAL[2]) / (DIAL[3] - DIAL[2])))
-        err = math.exp(math.log(ERR) + (math.log(ERR_MAX) - math.log(ERR)) * k)
-    st.update(view=view, viewB=viewB, wipe=wipe, errorPx=err)
+    st.update(shot=shot, view=view, viewB=viewB, wipe=wipe, errorPx=ERR)
     return st
