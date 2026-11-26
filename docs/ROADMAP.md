@@ -158,6 +158,69 @@ Spike first (a few days), because everything depends on Blender handling it:
 Done when: T1 on both benchmark scenes, viewport fps at least as good as today
 (T2), memory flat (T3), and the existing crack tests pass for instanced cuts.
 
+### Spike result (November 2026): go, with two mitigations
+
+Measured on the statue avenue and the synthetic field (RTX A4500, Blender 5.1.2):
+
+- Atoms are real: on every copy, the atom cut equals the per-cluster cut to the
+  triangle (`tools/atoms_check.py`, 8 cameras; 200 random views per asset in the
+  spike). Statue 4,542 atoms, floor patch 5,155, 128 / 384 / 1,920 triangles
+  (10th / median / 90th percentile).
+- A view needs few instances: 1.8-3k (copy, atom) pairs per avenue instancer,
+  20-28k on the synthetic field.
+- Mitigation 1, no atom objects: with ~10k atom objects in the scene, every
+  depsgraph update cost ~95 ms, even for an unrelated mesh. Instead, each slice
+  of 512 atoms is one mesh (atom index as a face attribute) on a library object
+  whose Split to Instances runs once; each slice has a point cloud that reads it
+  with Object Info + Pick Instance. A full avenue cut change: ~10 ms depsgraph.
+- Mitigation 2, an instance cost: EEVEE pays ~2 us per instance per frame. In
+  the viewport each copy is drawn as its atoms or as one whole level mesh,
+  whichever costs less counting ~300 triangles per instance (synthetic field,
+  EEVEE flying: 17.7 fps atoms only, 29.5 fps with the fallback).
+- Parent-merged blocks would cut instances by another 33-40 % at no triangle
+  cost (not built yet).
+
+Implemented as **Meshlet Instancing** on instancers (experimental, off by
+default; branch `phase2-atoms`):
+
+- [x] `vgeo_atoms`, `vgeo_extract_atom`, `vgeo_select_instances` (one call, all
+      copies, Off-screen modes per atom, multithreaded): 2-7 ms per instancer.
+- [x] Sliced object-free atom libraries, one point cloud per slice, spare points.
+- [x] Live loop: paced updates (at most every 0.2 s while the view moves, at
+      once when it stops); per-copy level fallback in the viewport.
+- [x] Tests: atom cut = per-cluster cut, watertight instanced cut, culled atoms
+      leave the instancing, final render cut, save/load, switching back.
+- [ ] Parent-merged blocks (fewer instances).
+- [ ] Proxies as single-copy instancers; retire chunk meshes and streamed copies
+      (needs the owner's go).
+
+T1, triangles drawn (`tools/instancing_bench.py`, 1280x720, the bench's error):
+
+| | Today (Shadows / Cull) | Atoms (Shadows / Cull) | cut+cull |
+|---|---|---|---|
+| Statue avenue, mean of 8 cameras, 1.5 px | 1,572,264 / 1,505,053 | 1,316,119 / 1,208,493 | 1,243,178 |
+| Synthetic field, 1 px | 14,424,403 / 14,309,348 | 6,061,381 / 5,919,547 | 5,911,265 |
+
+Atoms draw within 6 % of cut+cull in Shadows mode and at or under it in Cull
+(whole copies outside the view are skipped by the asset's tighter bounds).
+
+T2, GUI viewport flying the film path (`tests/viewport_bench.py --cameras ...
+--offscreen SHADOWS --seconds 24`, 2100x1341 region, 1 px, RTX A4500):
+
+| | Solid flying | EEVEE flying (worst frame) | EEVEE still |
+|---|---|---|---|
+| Statue avenue, today | 17.5 fps | 13.0 fps (264 ms) | 24.6 fps |
+| Statue avenue, atoms | 53.6 fps | 23.6 fps (96 ms) | 42.7 fps |
+| Synthetic field, today | 33.9 fps | 21.6 fps (131 ms) | 52.2 fps |
+| Synthetic field, atoms | 77.8 fps | 29.5 fps (85 ms) | 26.7 fps* |
+
+*Run-to-run spread of EEVEE numbers on this remote machine is about 20 %.
+
+Final renders (EEVEE, 1280x720, 1.5 px): Shadows mode is pixel-identical to
+Coarsen with atoms, as without; atoms against today's path differ by 0.13-0.2
+/255 on average (fine carved detail on mid-distance statues, where whole-copy
+levels draw finer than needed).
+
 ## Phase 3: occlusion culling
 
 Skip copies (and, with phase 2, atoms) hidden behind others: rows of statues and
@@ -174,6 +237,21 @@ dense forests hide most of what is in the frustum.
 - Done when: at least 30% fewer triangles than phase 2 alone on ground-level
   views of the statue avenue, with no pixel differences in the shadow check
   (render with and without, diff).
+
+Result (November 2026): built (`vgeo_occlusion_*`, the instancer's Occlusion
+Culling option, off by default), but it saves little on the benchmark scenes,
+so the 30 % target is not met:
+
+| Cull mode, triangles drawn | Atoms | + occlusion (256x144) | + ideal buffer (1280x720, exact, no erosion) |
+|---|---|---|---|
+| Statue avenue, mean of 8 cameras | 1,208,493 | 1,175,400 (-2.7 %) | 1,137,881 (-5.8 %) |
+| Synthetic field, mean of 3 cameras | 5,919,547 | 5,793,349 (-2.1 %) | 5,597,985 (-5.4 %) |
+
+Even with a near-ideal buffer the gain is ~6 %: level of detail already makes
+what hides behind the nearest copies cheap (distant, coarse), and atoms are
+tested by bounding spheres. Building the buffer costs 20-30 ms per update.
+Worth revisiting for interiors or dense forests seen from inside; not for open
+scenes like these.
 
 ## Phase 4: the product
 
