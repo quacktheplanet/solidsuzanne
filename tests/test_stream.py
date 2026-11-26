@@ -801,6 +801,26 @@ def run():
         n_l, t_l = drawn()
         check("meshlet instancing survives save/load", inst.vgeo_inst.use_atoms and n_l == n_c and t_l == t_c,
               f"{n_l} vs {n_c}")
+        # two views: the cut satisfies both (no fewer triangles than either alone)
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        v1 = stream.camera_view(bpy.context.scene)
+        camera((30, 10, 4), target=(0, 10, -1), lens=35)
+        v2 = stream.camera_view(bpy.context.scene)
+        t_each = []
+        for vv in ([v1], [v2], [v1, v2]):
+            instances.update(inst, vv, 1.0)
+            t_each.append(inst.vgeo_inst.shown_triangles)
+        check("two views: the cut serves both", t_each[2] >= max(t_each[0], t_each[1]), str(t_each))
+        # Rebuild Levels also rebuilds the atom libraries (fresh handle), clouds keep working
+        libs_before = sorted(o.name for o in instances.atom_libraries(inst).values())
+        bpy.context.view_layer.objects.active = inst
+        rc = bpy.ops.vgeo.rebuild_levels()
+        instances.update(inst, [v1], 1.0)
+        n_rb, t_rb = drawn()
+        check("rebuild keeps meshlet instancing working", rc == {'FINISHED'} and n_rb > 0
+              and t_rb == t_each[0] and len(instances.atom_libraries(inst)) == len(libs_before), f"{t_rb:,}")
+        camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+        views = [stream.camera_view(bpy.context.scene)]
         inst.vgeo_inst.use_atoms = False
         instances.update(inst, views, 1.0)
         n_o, _ = drawn()

@@ -1143,6 +1143,20 @@ def build_atoms(inst):
     return len(atoms)
 
 
+def rebuild_atoms(inst):
+    """Rebuild the atom libraries from the asset as it is now (a fresh native handle: the file may
+    have been re-virtualized), keeping the clouds."""
+    uid = inst.vgeo_inst.uid
+    a = _atom_assets.pop(uid, None)
+    if a is not None:
+        a.close()
+    n = build_atoms(inst)
+    if inst.vgeo_inst.use_atoms:
+        _ensure_clouds(inst)
+        sync_cloud_visibility(inst)
+    return n
+
+
 def _ensure_clouds(inst):
     """One point cloud per atom slice, parented to the instancer, linked where it is."""
     vi = inst.vgeo_inst

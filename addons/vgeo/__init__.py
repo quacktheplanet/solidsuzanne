@@ -144,7 +144,7 @@ class VGEO_OT_scatter(bpy.types.Operator):
 
 
 class VGEO_OT_rebuild_levels(bpy.types.Operator):
-    """Rebuild the instancer's level meshes from its asset (after re-virtualizing or changing materials)"""
+    """Rebuild the instancer's level meshes (and atom libraries) from its asset (after re-virtualizing or changing materials)"""
     bl_idname = "vgeo.rebuild_levels"
     bl_label = "Rebuild Levels"
 
@@ -156,6 +156,8 @@ class VGEO_OT_rebuild_levels(bpy.types.Operator):
     def execute(self, context):
         ob = context.active_object
         instances.build_levels(ob, ob.vgeo_inst.source)
+        if ob.vgeo_inst.use_atoms or ob.vgeo_inst.atoms is not None:
+            instances.rebuild_atoms(ob)
         return {'FINISHED'}
 
 

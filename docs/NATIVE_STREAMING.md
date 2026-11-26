@@ -272,7 +272,7 @@ flying the film path at a 1280x800 window; RTX A4500):
 | Statue avenue, today | 1.57M / 1.51M | 16.3 fps | 13.1 fps (210 ms) | 30.5 fps |
 | Statue avenue, meshlet instancing | 1.32M / 1.21M | 86.2 fps | 50.5 fps (66 ms) | 78.8 fps |
 | Synthetic field, today | 14.4M / 14.3M | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
-| Synthetic field, meshlet instancing | 6.06M / 5.92M | 114.5 fps | 71.9 fps (39 ms) | 81.6 fps |
+| Synthetic field, meshlet instancing | 6.06M / 5.92M | 115.3 fps | 73.3 fps (37 ms) | 83.1 fps |
 
 A meshlet cut on every copy with off-screen copies skipped (the browser
 library's rule) draws 1.24M and 5.91M: meshlet instancing is within 6 % of it
