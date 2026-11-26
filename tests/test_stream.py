@@ -972,6 +972,94 @@ def run():
     linked += [sc.name for sc in bpy.data.scenes if gcol.name in sc.collection.children]
     check("deleted proxy's chunks are unlinked", not linked, str(linked))
 
+    # ---- Virtualize Instances: an existing scatter handed to VGEO instancers
+    from vgeo import scatter as vscatter
+    proxy.vgeo.path = good   # the missing-file test above pointed it elsewhere
+    stream.runtime_for(proxy)
+    src_mesh = proxy.vgeo.source
+    if src_mesh is not None:
+        scene = bpy.context.scene
+
+        def own_instances(ob):
+            dg = bpy.context.evaluated_depsgraph_get()
+            return [np.array(i.matrix_world) for i in dg.object_instances
+                    if i.is_instance and i.parent and i.parent.original == ob and i.object.original == src_mesh]
+
+        # Geometry Nodes: Distribute Points on Faces -> Instance on Points (Object Info, as instance)
+        bpy.ops.mesh.primitive_plane_add(size=30, location=(300, 0, 0))
+        gn_ground = bpy.context.active_object
+        ng = bpy.data.node_groups.new("ScatterTest", "GeometryNodeTree")
+        ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        n_, L_ = ng.nodes, ng.links
+        gi, go = n_.new("NodeGroupInput"), n_.new("NodeGroupOutput")
+        dist = n_.new("GeometryNodeDistributePointsOnFaces")
+        dist.inputs["Density"].default_value = 0.15
+        oi = n_.new("GeometryNodeObjectInfo")
+        oi.inputs["Object"].default_value = src_mesh
+        oi.inputs["As Instance"].default_value = True
+        rnd = n_.new("FunctionNodeRandomValue")
+        rnd.data_type = 'FLOAT'
+        rnd.inputs[2].default_value, rnd.inputs[3].default_value = 0.5, 1.2
+        iop = n_.new("GeometryNodeInstanceOnPoints")
+        join = n_.new("GeometryNodeJoinGeometry")
+        L_.new(gi.outputs[0], dist.inputs["Mesh"])
+        L_.new(dist.outputs["Points"], iop.inputs["Points"])
+        L_.new(oi.outputs["Geometry"], iop.inputs["Instance"])
+        L_.new(dist.outputs["Rotation"], iop.inputs["Rotation"])
+        L_.new(rnd.outputs[1], iop.inputs["Scale"])
+        L_.new(gi.outputs[0], join.inputs[0])
+        L_.new(iop.outputs[0], join.inputs[0])
+        L_.new(join.outputs[0], go.inputs[0])
+        gn_ground.modifiers.new("Scatter", 'NODES').node_group = ng
+        before = own_instances(gn_ground)
+        for o in bpy.context.view_layer.objects:
+            o.select_set(False)
+        gn_ground.select_set(True)
+        bpy.context.view_layer.objects.active = gn_ground
+        rc = bpy.ops.vgeo.virtualize_instances()
+        made = [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == gn_ground.name]
+        ok_place = False
+        if made:
+            mi = made[0]
+            got = [np.array(mi.matrix_world @ instances.placement_matrix(mi, i)) for i in range(len(mi.data.vertices))]
+            key = lambda m: tuple(np.round(m[:3, 3], 4))
+            a_ = sorted(before, key=key)
+            b_ = sorted(got, key=key)
+            ok_place = len(a_) == len(b_) and all(np.allclose(x, y, atol=1e-4) for x, y in zip(a_, b_))
+        after = own_instances(gn_ground)
+        dg = bpy.context.evaluated_depsgraph_get()
+        faces = len(gn_ground.evaluated_get(dg).data.polygons)
+        check("Virtualize Instances takes a Geometry Nodes scatter",
+              rc == {'FINISHED'} and len(made) == 1 and made[0].vgeo_inst.source == proxy and len(before) > 10
+              and ok_place, f"{len(before)} instances")
+        check("the scatter's own instances go, its surface stays", not after and faces == 1, f"{len(after)} left")
+        rc = bpy.ops.vgeo.restore_instances()
+        check("Restore Instances brings them back",
+              rc == {'FINISHED'} and len(own_instances(gn_ground)) == len(before)
+              and not [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == gn_ground.name])
+
+        # a particle system rendering the mesh as objects (hair)
+        bpy.ops.mesh.primitive_plane_add(size=30, location=(360, 0, 0))
+        p_ground = bpy.context.active_object
+        p_ground.modifiers.new("Particles", 'PARTICLE_SYSTEM')
+        st = p_ground.particle_systems[0].settings
+        st.type = 'HAIR'
+        st.count = 40
+        st.render_type = 'OBJECT'
+        st.instance_object = src_mesh
+        st.particle_size = 0.5
+        before = own_instances(p_ground)
+        rc = bpy.ops.vgeo.virtualize_instances()
+        made = [o for o in bpy.data.objects if o.get(vscatter.MADE_PROP) == p_ground.name]
+        check("Virtualize Instances takes a particle system",
+              rc == {'FINISHED'} and len(made) == 1 and len(made[0].data.vertices) == len(before) == 40
+              and not own_instances(p_ground) and st.render_type == 'NONE', f"{len(before)} particles")
+        bpy.ops.vgeo.restore_instances()
+        check("restoring particles", st.render_type == 'OBJECT' and len(own_instances(p_ground)) == 40)
+        for o in (gn_ground, p_ground):
+            bpy.data.objects.remove(o)
+
     # restore brings the source back
     proxy_uid = proxy.vgeo.uid
     bpy.context.view_layer.objects.active = proxy

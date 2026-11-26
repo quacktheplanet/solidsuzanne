@@ -18,7 +18,7 @@ bl_info = {
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
-from . import build, instances, native, stream
+from . import build, instances, native, scatter, stream
 
 
 def _invalidate(self, _context):
@@ -392,6 +392,10 @@ class VGEO_PT_panel(bpy.types.Panel):
             layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
             if ob is not None and ob.type == 'MESH':
                 layout.label(text=f"{len(ob.data.polygons):,} faces")
+            if ob is not None:
+                row = layout.row(align=True)
+                row.operator(VGEO_OT_virtualize_instances.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
+                row.operator(VGEO_OT_restore_instances.bl_idname, text="", icon='LOOP_BACK')
             return
         v = ob.vgeo
         rt = stream._runtimes.get(v.uid)
@@ -426,12 +430,70 @@ class VGEO_PT_panel(bpy.types.Panel):
         layout.operator(VGEO_OT_scatter.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
 
 
+class VGEO_OT_virtualize_instances(bpy.types.Operator):
+    """Hand the active object's instances of virtualized meshes (Geometry Nodes, particles, collection
+    instances) to VGEO instancers, and switch its own instances off"""
+    bl_idname = "vgeo.virtualize_instances"
+    bl_label = "Virtualize Instances"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    meshlet_instancing: BoolProperty(name="Meshlet Instancing", default=False,
+                                     description="Draw every copy as its own meshlet cut (experimental)")
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and not ob.vgeo.uid and not ob.vgeo_inst.uid and context.mode == 'OBJECT'
+
+    def execute(self, context):
+        src = context.active_object
+        made, missing, spread = scatter.virtualize_instances(context, src)
+        for m, why in missing.items():
+            if isinstance(why, int):
+                self.report({'WARNING'}, f"{m}: {why} instances left as they are; virtualize {m} first")
+            else:
+                self.report({'WARNING'}, f"{m}: {why} instances left as they are: its VGEO asset could not be opened")
+        if not made:
+            if not missing:
+                self.report({'ERROR'}, f"{src.name} has no instances of meshes")
+            return {'CANCELLED'}
+        if spread > 0.01:
+            self.report({'WARNING'}, f"Non-uniform instance scale approximated (up to {spread:.0%} apart)")
+        views = stream.viewport_views() if context.window_manager.windows else []
+        for inst in made:
+            if self.meshlet_instancing and native.has_atoms():
+                inst.vgeo_inst.use_atoms = True
+            if views:
+                instances.update(inst, views, inst.vgeo_inst.pixel_error)
+        n = sum(len(i.data.vertices) for i in made)
+        self.report({'INFO'}, f"{n:,} instances in {len(made)} VGEO instancer(s)")
+        return {'FINISHED'}
+
+
+class VGEO_OT_restore_instances(bpy.types.Operator):
+    """Bring back the active object's own instances and delete the VGEO instancers made from them"""
+    bl_idname = "vgeo.restore_instances"
+    bl_label = "Restore Instances"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.active_object
+        return ob is not None and any(o.get(scatter.MADE_PROP) == ob.name for o in bpy.data.objects)
+
+    def execute(self, context):
+        scatter.restore_instances(context.active_object)
+        return {'FINISHED'}
+
+
 classes = (VGEOObjectSettings, VGEOInstanceSettings, VGEO_OT_virtualize, VGEO_OT_restore, VGEO_OT_export_web,
-           VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_PT_panel)
+           VGEO_OT_scatter, VGEO_OT_rebuild_levels, VGEO_OT_refresh, VGEO_OT_virtualize_instances,
+           VGEO_OT_restore_instances, VGEO_PT_panel)
 
 
 def _menu(self, _context):
     self.layout.operator(VGEO_OT_virtualize.bl_idname, icon='MOD_DECIM')
+    self.layout.operator(VGEO_OT_virtualize_instances.bl_idname, icon='OUTLINER_OB_POINTCLOUD')
 
 
 def register():
