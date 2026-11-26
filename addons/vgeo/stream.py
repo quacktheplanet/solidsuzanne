@@ -815,12 +815,14 @@ def update_for_render(scene, depsgraph=None):
     if view is None:
         return
     from . import instances
+    fix_duplicates()
     # instancers first: they choose which copies get a streamed cut and make it now
     with instances.tick_scope():
         for inst in instances.instancers(scene):
-            if inst.vgeo_inst.atoms is not None:
+            if inst.vgeo_inst.atoms is not None and inst.library is None:
                 instances.sync_cloud_visibility(inst)
-        insts = [i for i in instances.instancers(scene) if not i.hide_render]
+        insts = [i for i in instances.instancers(scene) if not i.hide_render
+                 and i.library is None and i.data.library is None]
         vl_objects = bpy.context.view_layer.objects if bpy.context.view_layer else None
         occluders = [i for i in insts if vl_objects is None or i.name in vl_objects]
         instances.prepare_occlusion(occluders, [view])
@@ -854,8 +856,52 @@ def _orphan_check():
     return True
 
 
+_dup_sig = None
+
+
+def fix_duplicates():
+    """Duplicating a proxy or an instancer copies its ID. The object that owns the children (chunks,
+    atom clouds, streamed copies) keeps it; each copy gets a new ID and makes children of its own."""
+    global _dup_sig
+    from . import instances
+    objs = [o for o in bpy.data.objects if o.library is None and (o.vgeo.uid or o.vgeo_inst.uid)]
+    sig = (len(bpy.data.objects), tuple(sorted((o.name, o.vgeo.uid, o.vgeo_inst.uid) for o in objs)))
+    if sig == _dup_sig:
+        return 0
+    fixed = 0
+    groups = {}
+    for o in objs:
+        if o.vgeo.uid and not o.vgeo.slot_of:
+            groups.setdefault(("p", o.vgeo.uid), []).append(o)
+        if o.vgeo_inst.uid:
+            groups.setdefault(("i", o.vgeo_inst.uid), []).append(o)
+    for (kind, _uid), group in groups.items():
+        if len(group) < 2:
+            continue
+        def owns(o):
+            if kind == "p":
+                col = o.vgeo.collection
+                return col is not None and any(c.parent == o for c in col.objects)
+            return any(c.parent == o for c in o.children)
+        group.sort(key=lambda o: (not owns(o), len(o.name), o.name))
+        for o in group[1:]:
+            if kind == "p":
+                o.vgeo.uid = new_uid()
+                o.vgeo.collection = None          # chunks of its own, made on its first cut
+            else:
+                o.vgeo_inst.uid = new_uid()
+                me = o.data
+                if me.users > 1:                  # a linked duplicate shares the placements: give it its own
+                    o.data = me.copy()
+                instances._write_streamed(o, np.zeros(len(o.data.vertices), bool))
+            fixed += 1
+    _dup_sig = sig if not fixed else None
+    return fixed
+
+
 def _housekeeping(objs, vl):
     """Selection, visibility and collection links of the chunks follow the proxy."""
+    fix_duplicates()
     redirect_selection(vl)
     for obj in proxies():
         if obj.vgeo.collection is not None:
@@ -878,8 +924,11 @@ def _tick():
         for inst in instances.instancers():
             if inst.vgeo_inst.atoms is not None:
                 instances.sync_cloud_visibility(inst, bpy.context.view_layer)
-        insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze]
+        # linked from another file: their placements cannot be written, so they show what was saved
+        insts = [o for o in instances.instancers() if not o.vgeo_inst.freeze
+                 and o.library is None and o.data.library is None]
         if not objs and not insts:
+            fix_duplicates()
             _orphan_check()  # a deleted proxy's chunks must not linger
             return 0.5
         vl = bpy.context.view_layer

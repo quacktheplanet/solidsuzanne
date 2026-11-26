@@ -979,6 +979,52 @@ def run():
     linked += [sc.name for sc in bpy.data.scenes if gcol.name in sc.collection.children]
     check("deleted proxy's chunks are unlinked", not linked, str(linked))
 
+    # ---- duplicating a proxy or an instancer: the copy gets an ID (and children) of its own
+    scene = bpy.context.scene
+    proxy.vgeo.path = good
+    inst = next(o for o in bpy.data.objects if o.vgeo_inst.uid and not o.get("vgeo_made_from"))
+    inst.vgeo_inst.use_atoms = True
+    camera((0, -12, 1.5), target=(0, 30, -1), lens=35)
+    views = [stream.camera_view(scene)]
+    instances.update(inst, views, 1.0)
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    inst.select_set(True)
+    bpy.context.view_layer.objects.active = inst
+    bpy.ops.object.duplicate()
+    dup = bpy.context.active_object
+    n_fixed = stream.fix_duplicates()
+    instances.update(inst, views, 1.0)
+    instances.update(dup, views, 1.0)
+    dg = bpy.context.evaluated_depsgraph_get()
+    def n_of(owner):
+        return sum(1 for i in dg.object_instances if i.is_instance and i.parent
+                   and i.parent.original.parent == owner and instances.SLICE_PROP in i.parent.original)
+    check("a duplicated instancer gets its own ID and clouds", dup != inst and n_fixed >= 1
+          and dup.vgeo_inst.uid != inst.vgeo_inst.uid and n_of(inst) > 0 and n_of(dup) == n_of(inst),
+          f"{n_of(inst)} / {n_of(dup)} instances")
+    bpy.data.objects.remove(dup)
+    instances.unlink_orphan_slots()
+    inst.vgeo_inst.use_atoms = False
+    for o in bpy.context.view_layer.objects:
+        o.select_set(False)
+    proxy.select_set(True)
+    bpy.context.view_layer.objects.active = proxy
+    n_chunks = len(proxy.vgeo.collection.objects)
+    bpy.ops.object.duplicate()
+    pdup = bpy.context.active_object
+    stream.fix_duplicates()
+    rt_dup = stream.apply_cut(pdup, views, 1.0, force=True)
+    check("a duplicated proxy streams into chunks of its own",
+          pdup.vgeo.uid != proxy.vgeo.uid and pdup.vgeo.collection not in (None, proxy.vgeo.collection)
+          and rt_dup.triangles > 0 and len(proxy.vgeo.collection.objects) == n_chunks
+          and all(c.parent == pdup for c in pdup.vgeo.collection.objects), f"{rt_dup.triangles:,}")
+    dcol = pdup.vgeo.collection
+    for c in list(dcol.objects):
+        bpy.data.objects.remove(c)
+    bpy.data.collections.remove(dcol)
+    bpy.data.objects.remove(pdup)
+
     # ---- debug views: every mesh VGEO writes carries vgeo_viz while one is on
     from vgeo import debug as vdebug
     scene = bpy.context.scene
