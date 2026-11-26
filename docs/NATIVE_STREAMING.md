@@ -227,6 +227,63 @@ the boulder's streamed cut is 353k triangles instead of 1.31M for level 0,
 and it takes over 0.85-0.95 s after the view arrives (5.0.1 and 5.1.2,
 Solid and EEVEE).
 
+## Meshlet Instancing (experimental)
+
+Whole-copy levels draw a copy at the detail its nearest point needs, so they
+cost about twice a meshlet cut, and streamed copies only help a few heavy
+copies. **Meshlet Instancing** (an instancer option, off by default) gives
+every copy its own meshlet cut, built from pieces that never change:
+
+- **Atoms.** The clusters sharing a (group, refined) pair are always in or out
+  of the cut together, so each such set is a fixed piece of the asset at a
+  fixed detail. `vgeo_select_instances` selects the cut of every copy in one
+  native call (Off-screen modes per atom, multithreaded over copies) and
+  returns (copy, atom) pairs: 2-7 ms for 1,700 copies.
+- **Blocks.** The atoms simplified from one parent group are drawn as one
+  piece when all of them made a copy's cut: same triangles, 17-44 % fewer
+  instances, one more copy of the DAG's geometry in Blender.
+- **Libraries, not objects.** Each slice of 512 atoms and blocks is one mesh
+  (the piece's index as a face attribute) on a library object whose Split to
+  Instances runs once. Thousands of atom objects would cost every depsgraph
+  update ~95 ms; libraries cost nothing until read.
+- **Point clouds.** Each slice has a point cloud parented to the instancer:
+  one point per pair (the copy's placement, the piece's index), instanced by
+  Object Info + Instance on Points (Pick Instance). An update rewrites only
+  the clouds whose pairs changed, and clouds keep spare points (index -1) so
+  most writes keep their size. A full cut change on the statue avenue costs
+  ~10 ms of depsgraph time.
+- **Viewport pacing.** While the view moves, a new cut lands at most every
+  0.2 s, and at once when the view stops. EEVEE pays ~2 us per instance per
+  frame, so the viewport keeps each instancer under 8,000 instances: copies
+  start as one whole level mesh and switch to their atoms in order of
+  triangles saved per extra instance, when each saves at least 1,000. Final
+  renders always draw the full atom cut.
+- **Visibility** of the clouds follows the instancer; a deleted instancer's
+  clouds leave the scene.
+
+Measured against today's path (`tools/instancing_bench.py`, 1280x720, the
+bench error; `tests/viewport_bench.py --cameras ... --offscreen SHADOWS`,
+flying the film path at a 1280x800 window; RTX A4500):
+
+| | Triangles, Shadows / Cull | Solid flying | EEVEE flying (worst) | EEVEE still |
+|---|---|---|---|---|
+| Statue avenue, today | 1.57M / 1.51M | 16.3 fps | 13.1 fps (210 ms) | 30.5 fps |
+| Statue avenue, meshlet instancing | 1.32M / 1.21M | 63.5 fps | 38.5 fps (79 ms) | 57.6 fps |
+| Synthetic field, today | 14.4M / 14.3M | 54.4 fps | 36.8 fps (100 ms) | 83.6 fps |
+| Synthetic field, meshlet instancing | 6.06M / 5.92M | 114.5 fps | 71.9 fps (39 ms) | 81.6 fps |
+
+A meshlet cut on every copy with off-screen copies skipped (the browser
+library's rule) draws 1.24M and 5.91M: meshlet instancing is within 6 % of it
+in Shadows mode and at or under it in Cull (whole copies outside the view are
+skipped by the asset's bounds, tighter than the per-cluster spheres).
+
+**Occlusion Culling** (with Meshlet Instancing, off by default) draws the
+nearest copies' coarse levels into a 256x144 CPU depth buffer (pushed back by
+their error, eroded a pixel) and leaves out hidden copies and pieces; in
+Shadows mode a hidden copy stays while its sun shadow volume is visible. On
+these open scenes it saves only 2-3 % (about 6 % even with an exact
+full-resolution buffer) for 20-30 ms per update, so it stays off.
+
 ## On the web
 
 `web/vgeo-viewer.js` renders the same assets with WebGPU: a compute pass
