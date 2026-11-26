@@ -6,6 +6,8 @@ EEVEE and in Cycles.
 
 Status: November 2026. Phase 1 has started (see the checklist below).
 
+Picking this up as an agent? Start with `docs/AGENT_BRIEF.md`.
+
 ---
 
 ## What "as good as the browser" means
