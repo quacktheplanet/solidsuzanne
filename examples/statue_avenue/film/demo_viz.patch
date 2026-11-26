@@ -1,0 +1,80 @@
+diff -ruN a/addons/vgeo/stream.py b/addons/vgeo/stream.py
+--- a/addons/vgeo/stream.py	2026-11-26 09:05:56.510374865 -0500
++++ b/addons/vgeo/stream.py	2026-11-26 09:05:56.537014290 -0500
+@@ -517,6 +517,39 @@
+     return a
+ 
+ 
++# ---- DEMO BUILD ONLY: breakdown attributes for the tech-demo films ---------------------------
++# runtime.cpp packs (cluster_id << 6) | depth into face_lod in this build. Each chunk mesh gets a
++# corner BYTE_COLOR "vgeo_viz": RGB = a hash colour per cluster (meshlet view), A = depth / 16 (the
++# LOD ramp in the statue avenue materials). Write byte colours through foreach_set, never the raw
++# float fast path (that corrupted the heap).
++DEMO_VIZ = True
++
++
++def _hash_u32(x):
++    x = x.astype(np.uint32)
++    x ^= x >> np.uint32(16)
++    x *= np.uint32(0x7feb352d)
++    x ^= x >> np.uint32(15)
++    x *= np.uint32(0x846ca68b)
++    x ^= x >> np.uint32(16)
++    return x
++
++
++def _demo_viz_attrs(me, data):
++    packed = data["face_lod"].astype(np.int64)
++    nt = len(packed)
++    cid = (packed >> 6).astype(np.uint32)
++    depth = (packed & 63).astype(np.float32)
++    hc = _hash_u32(cid * np.uint32(2654435761) + np.uint32(17))
++    rgba = np.empty((nt, 4), np.float32)
++    rgba[:, 0] = (hc & np.uint32(0xFF)).astype(np.float32) / 255.0
++    rgba[:, 1] = ((hc >> np.uint32(8)) & np.uint32(0xFF)).astype(np.float32) / 255.0
++    rgba[:, 2] = ((hc >> np.uint32(16)) & np.uint32(0xFF)).astype(np.float32) / 255.0
++    rgba[:, 3] = depth / 16.0
++    a = me.attributes.new("vgeo_viz", 'BYTE_COLOR', 'CORNER')
++    a.data.foreach_set("color", np.ascontiguousarray(np.repeat(rgba, 3, axis=0)).ravel())
++
++
+ def fill_mesh(me, data, materials, lod_colors):
+     """Replace a mesh's geometry with an extracted chunk."""
+     global _fast_write
+@@ -544,8 +577,10 @@
+         _set_attr(me, "UVMap", 'FLOAT2', 'CORNER', "vector", corner_uv)
+     if len(materials) > 1:
+         _set_attr(me, "material_index", 'INT', 'FACE', "value", data["face_materials"])
++    if DEMO_VIZ:
++        _demo_viz_attrs(me, data)
+     if lod_colors:
+-        lod = np.repeat(data["face_lod"] % len(LOD_PALETTE), 3)
++        lod = np.repeat((data["face_lod"] & 63) % len(LOD_PALETTE), 3)
+         col = _set_attr(me, "vgeo_lod", 'FLOAT_COLOR', 'CORNER', "color",
+                         np.ascontiguousarray(LOD_PALETTE[lod]).ravel())
+         me.color_attributes.active_color = col
+@@ -808,7 +843,12 @@
+     return rt
+ 
+ 
++FREEZE = False   # DEMO: keep the last cut, to look at it from another camera
++
++
+ def update_for_render(scene, depsgraph=None):
++    if FREEZE:
++        return
+     view = camera_view(scene, depsgraph)
+     if view is None:
+         return
+diff -ruN a/src/stream/runtime.cpp b/src/stream/runtime.cpp
+--- a/src/stream/runtime.cpp	2026-11-26 09:05:56.519456415 -0500
++++ b/src/stream/runtime.cpp	2026-11-26 09:05:56.536779915 -0500
+@@ -444,7 +444,7 @@
+                 a->out_corner.push_back(a->remap_val[slot]);
+             }
+             a->out_mat.push_back(int32_t(a->vmat[idx[t * 3]]));
+-            a->out_lod.push_back(int32_t(c.depth));
++            a->out_lod.push_back(int32_t((id << 6) | (c.depth & 63u)));   // DEMO: cluster id + depth
+         }
+     }
+     build_edges(*a, uint32_t(next));

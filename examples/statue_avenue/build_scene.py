@@ -11,7 +11,8 @@ Benchmark it with the film's cameras:
   blender -b OUT/statue_avenue.blend --python tools/instancing_bench.py -- \\
       --cameras examples/statue_avenue/cameras.json --error 1.5 --offscreen COARSEN,SHADOWS,CULL
 The materials have a "vgeo_mode" value node (0 beauty; 1 and 2 read a "vgeo_viz" debug attribute
-the add-on does not write yet, see docs/ROADMAP.md, Debug views)."""
+the add-on does not write yet, see docs/ROADMAP.md, Debug views). For the breakdown views, build the
+scene with a patched copy of the add-on: VGEO_ADDONS=/path/to/copy/addons (see film/README.md)."""
 import math
 import os
 import sys
@@ -23,7 +24,7 @@ from mathutils import Vector
 
 D = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, D)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(D)), "addons"))
+sys.path.insert(0, os.environ.get("VGEO_ADDONS", os.path.join(os.path.dirname(os.path.dirname(D)), "addons")))
 import assets  # noqa: E402
 import vgeo  # noqa: E402
 from vgeo import stream, instances  # noqa: E402
